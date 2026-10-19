@@ -53,6 +53,8 @@ class SnapshotLoader:
 
     @staticmethod
     def event_targets(subscription: Subscription, name: str) -> set[str]:
+        # Hand tells carry their own public display state, so applying them
+        # must not fetch or replace the authoritative game snapshot.
         if name in {"hand_signal", "hand_signals"}:
             return set()
         if subscription.kind == "lobby":
@@ -281,6 +283,21 @@ class LiveSession:
                 names = {message.name}
                 targets = self.loader.event_targets(subscription, message.name)
                 if not targets:
+                    if subscription.kind == "game" and message.name in {"hand_signal", "hand_signals"}:
+                        # Match the web client: live hand tells are applied as
+                        # public display hints, without changing game state.
+                        if message.name == "hand_signal":
+                            signal = message.payload
+                            if isinstance(signal.get("user_id"), str):
+                                update = panels.update({"hand_signals": [signal]}, message.name)
+                                if update is not None:
+                                    yield update
+                        else:
+                            signals = message.payload.get("signals")
+                            if isinstance(signals, list) and all(isinstance(row, dict) for row in signals):
+                                update = panels.update({"hand_signals": signals}, message.name)
+                                if update is not None:
+                                    yield update
                     continue
                 await asyncio.sleep(self.debounce)
                 while not queue.empty():

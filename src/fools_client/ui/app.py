@@ -4,7 +4,9 @@ from collections.abc import Callable
 import webbrowser
 
 from textual.app import App
+from textual.binding import Binding
 from textual.screen import Screen
+from textual.widgets import DataTable, Input, Select
 
 from fools_client.api import ApiClient
 from fools_client.auth import AuthService, UserProfile
@@ -19,7 +21,13 @@ from fools_client.ui.lobbies import LobbiesScreen
 class FoolsApp(App[None]):
     TITLE = "Fools Arena"
     CSS_PATH = "client.tcss"
-    BINDINGS = [("ctrl+q", "quit", "Quit client")]
+    BINDINGS = [
+        ("ctrl+q", "quit", "Quit client"),
+        Binding("up", "focus_previous", "Previous control", show=True, priority=True),
+        Binding("down", "focus_next", "Next control", show=True, priority=True),
+        Binding("left", "focus_previous_horizontal", "Previous control", show=False),
+        Binding("right", "focus_next_horizontal", "Next control", show=False),
+    ]
 
     def __init__(
         self, client: ApiClient, *, transport_notice: str = "",
@@ -36,6 +44,24 @@ class FoolsApp(App[None]):
         self.profile: UserProfile | None = None
         self._navigation = 0
         self.sub_title = client.server
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {
+            "focus_previous", "focus_next", "focus_previous_horizontal", "focus_next_horizontal",
+        }:
+            if isinstance(self.focused, (DataTable, Select)):
+                return None
+            if isinstance(self.focused, Input) and action in {
+                "focus_previous_horizontal", "focus_next_horizontal",
+            }:
+                return None
+        return True
+
+    def action_focus_previous_horizontal(self) -> None:
+        self.screen.focus_previous()
+
+    def action_focus_next_horizontal(self) -> None:
+        self.screen.focus_next()
 
     def on_mount(self) -> None:
         self.push_screen(AuthScreen())

@@ -161,6 +161,18 @@ class ApiClient:
             except (ValueError, RecursionError):
                 raise ProtocolError("The API returned invalid JSON instead of the expected snapshot.") from None
 
+    async def request_page(self, path: str) -> str | None:
+        """Fetch same-origin HTML for the lobby page's current-membership metadata."""
+        if path != "/fools/":
+            raise ConfigurationError("Only the lobby page may be requested as HTML.")
+        async with self._lock:
+            response = await self._send("GET", path, headers={"Accept": "text/html"})
+            if response.is_redirect or not response.is_success:
+                return None
+            if "text/html" not in response.headers.get("Content-Type", "").lower():
+                return None
+            return response.text
+
     async def _forget_session(self) -> None:
         self._http.cookies.clear()
         await asyncio.to_thread(self._store.clear)

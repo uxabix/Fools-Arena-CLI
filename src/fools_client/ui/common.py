@@ -26,6 +26,21 @@ class SnapshotTable(DataTable):
     def setup(self, *columns: str) -> None:
         self._column_keys = self.add_columns(*columns)
 
+    def action_cursor_down(self) -> None:
+        # Keep arrow navigation within rows, but let the user leave the table
+        # from its last row and continue to the controls below it.
+        if not self.row_count or self.cursor_row >= self.row_count - 1:
+            self.screen.focus_next()
+            return
+        super().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        # Likewise, move to the previous control from the first row.
+        if not self.row_count or self.cursor_row <= 0:
+            self.screen.focus_previous()
+            return
+        super().action_cursor_up()
+
     @property
     def selected_id(self) -> str | None:
         if not self.row_count or not 0 <= self.cursor_row < self.row_count:

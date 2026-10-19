@@ -148,6 +148,34 @@ class SocketFeed:
             )
         raise ProtocolError(f"The server rejected the WebSocket connection: HTTP {status}.")
 
+    async def send(self, subscription: Subscription, payload: dict[str, Any]) -> None:
+        """Send one client event through an authenticated server WebSocket."""
+        address = httpx.URL(self.client.server + subscription.path)
+        uri = str(address.copy_with(scheme="wss" if address.scheme == "https" else "ws"))
+        headers = {}
+        cookie = self.client.cookie_header(subscription.path)
+        if cookie:
+            headers["Cookie"] = cookie
+        try:
+            async with _DirectConnect(
+                uri, additional_headers=headers, origin=self.client.server,
+                user_agent_header=f"CLI-Fools-Client/{version('cli-fools-client')}",
+                open_timeout=10, close_timeout=3, ping_interval=20, ping_timeout=20,
+                max_size=1048576, max_queue=16, compression=None, logger=self._logger,
+            ) as connection:
+                await connection.send(json.dumps(payload, separators=(",", ":")))
+        except InvalidStatus as error:
+            await self._check_handshake(error)
+        except ConnectionClosed as error:
+            closing = error.rcvd or error.sent
+            await self._check_close(closing.code if closing else None)
+        except ssl.SSLCertVerificationError:
+            raise ProtocolError("Could not verify the WebSocket server's TLS certificate.") from None
+        except (OSError, TimeoutError):
+            raise NetworkError(command_sent=True) from None
+        except InvalidHandshake:
+            raise ProtocolError("The server did not complete a valid WebSocket handshake.") from None
+
     async def events(
         self, subscription: Subscription,
     ) -> AsyncIterator[ConnectionNotice | ServerEvent]:
@@ -175,8 +203,7 @@ class SocketFeed:
                     yield ConnectionNotice("connected", attempt)
                     async for message in connection:
                         event = ServerEvent.parse(message)
-                        if event.name not in {"hand_signal", "hand_signals"}:
-                            yield event
+                        yield event
                     await self._check_close(connection.close_code)
             except InvalidStatus as error:
                 await self._check_handshake(error)

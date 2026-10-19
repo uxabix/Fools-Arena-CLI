@@ -77,12 +77,84 @@ Button {
     min-height: 5;
 }
 
-#players {
-    height: 10;
+#player-art, #pile-art {
+    height: auto;
     margin: 1 0;
 }
 
-#table, #hand, #chat {
+#pile-art {
+    width: 1fr;
+    align-horizontal: center;
+    align-vertical: middle;
+}
+
+.pile-item {
+    width: auto;
+    height: 7;
+    margin: 0 1;
+}
+
+.card-board {
+    width: 1fr;
+    height: 12;
+    min-height: 10;
+    padding: 1;
+    border: round $warning;
+    margin-bottom: 1;
+}
+
+#board-cards {
+    align-horizontal: center;
+}
+
+#hand-cards {
+    height: 11;
+    min-height: 9;
+    padding: 1;
+    align-horizontal: center;
+    border: round $accent;
+    margin-bottom: 1;
+}
+
+.game-card {
+    width: 11;
+    height: 7;
+    margin: 0 1;
+}
+
+.game-card.selected {
+    width: 15;
+    height: 9;
+}
+
+.trick-row {
+    width: 1fr;
+    layers: cards defense;
+    height: 9;
+    align: center middle;
+    margin: 0 1 0 0;
+}
+
+.trick-row > .game-card {
+    layer: cards;
+}
+
+.table-card {
+    layer: defense;
+    width: auto;
+    height: auto;
+    margin: 0 1;
+    offset: 5 -1;
+    background: $surface;
+}
+
+.card-arrow, .empty-board {
+    width: auto;
+    height: auto;
+    margin: 0 1;
+}
+
+#chat {
     height: 10;
     margin: 1 0;
 }

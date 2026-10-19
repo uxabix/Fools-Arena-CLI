@@ -1,5 +1,6 @@
 """Live lobby browser, forms, membership, readiness, and server-side start."""
 
+from html.parser import HTMLParser
 from typing import Any
 
 from textual import on
@@ -7,7 +8,7 @@ from textual.app import ComposeResult
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Select, Static
 
-from fools_client.errors import display_text
+from fools_client.errors import ClientError, display_text
 from fools_client.realtime import Subscription
 from fools_client.ui.common import ActionScreen, LiveScreen, SnapshotTable
 
@@ -15,6 +16,22 @@ STATUS_LABELS = {
     "waiting": "Waiting", "ready": "Ready", "playing": "Playing", "left": "Left",
     "in_progress": "In progress", "closed": "Closed", "finished": "Finished",
 }
+
+
+class _CurrentLobbyParser(HTMLParser):
+    """Read the current-lobby data attributes already rendered by the web UI."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lobby_id = ""
+        self.lobby_name = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        classes = set((values.get("class") or "").split())
+        if tag == "div" and {"game-page", "lobby-list-page"} <= classes:
+            self.lobby_id = values.get("data-current-lobby-id") or ""
+            self.lobby_name = values.get("data-current-lobby-name") or ""
 
 
 class LobbyRules(Vertical):
@@ -55,6 +72,8 @@ class LobbiesScreen(LiveScreen):
     def __init__(self, notice: str = ""):
         super().__init__(Subscription("lobbies"))
         self.initial_notice = notice
+        self.current_lobby_id = ""
+        self.current_lobby_name = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -65,6 +84,7 @@ class LobbiesScreen(LiveScreen):
             yield Static("Loading lobby list…", id="summary", markup=False)
             with Grid(classes="actions"):
                 yield Button("Join selected", id="join", variant="primary")
+                yield Button("Open current lobby", id="current-lobby", variant="success")
                 yield Button("Join by UUID", id="join-id")
                 yield Button("Create lobby", id="create")
                 yield Button("Refresh", id="refresh")
@@ -75,6 +95,7 @@ class LobbiesScreen(LiveScreen):
 
     def on_mount(self) -> None:
         self.query_one("#lobbies", SnapshotTable).setup("Name", "Players", "Ready", "Deck", "Mode")
+        self.query_one("#current-lobby", Button).display = False
         super().on_mount()
         self.query_one("#lobbies", SnapshotTable).focus()
 
@@ -95,12 +116,35 @@ class LobbiesScreen(LiveScreen):
             f"Lobbies: {len(rows)}. Private lobbies can be joined by UUID."
             if rows else "No public lobbies. Create one or join by UUID."
         )
+        self.run_worker(self._load_current_lobby(), group="current-lobby", exclusive=True)
+
+    async def _load_current_lobby(self) -> None:
+        try:
+            page = await self.client_app.client.request_page("/fools/")
+        except ClientError:
+            # The JSON lobby browser remains usable if optional page metadata is unavailable.
+            return
+        parser = _CurrentLobbyParser()
+        if page:
+            parser.feed(page)
+        if not self.is_mounted:
+            return
+        self.current_lobby_id = parser.lobby_id
+        self.current_lobby_name = parser.lobby_name
+        button = self.query_one("#current-lobby", Button)
+        button.display = bool(self.current_lobby_id)
+        button.label = (
+            f"Open current lobby: {display_text(self.current_lobby_name)}"
+            if self.current_lobby_name else "Open current lobby"
+        )
+        button.disabled = self.busy or not self.current_lobby_id
 
     def sync_controls(self) -> None:
         super().sync_controls()
         self.query_one("#join", Button).disabled = (
             self.busy or self.stale or self.query_one("#lobbies", SnapshotTable).selected_id is None
         )
+        self.query_one("#current-lobby", Button).disabled = self.busy or not self.current_lobby_id
 
     @on(SnapshotTable.RowHighlighted, "#lobbies")
     def highlighted(self) -> None:
@@ -122,6 +166,9 @@ class LobbiesScreen(LiveScreen):
                 self.selected()
             case "join-id":
                 self.go(JoinLobbyScreen())
+            case "current-lobby":
+                if self.current_lobby_id:
+                    self.go(LobbyScreen(self.current_lobby_id, "Opened your current lobby."))
             case "create":
                 self.go(CreateLobbyScreen())
             case "refresh":
