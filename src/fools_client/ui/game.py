@@ -4,8 +4,6 @@ import asyncio
 from typing import Any
 
 from rich import box
-from rich.columns import Columns
-from rich.console import Group
 from rich.cells import cell_len
 from rich.panel import Panel
 from rich.table import Table
@@ -16,6 +14,7 @@ from textual.binding import Binding
 from textual.containers import Grid, Horizontal, HorizontalScroll, Vertical, VerticalScroll
 from textual.events import Click
 from textual.message import Message
+from textual.reactive import reactive
 from textual.widgets import Button, Footer, Header, Input, Label, Static
 
 from fools_client.errors import ClientError, display_text
@@ -60,7 +59,10 @@ def _card_panel(
     rank = _rank_symbol(card.get("rank"))
     symbol = _suit_symbol(card.get("suit"))
     red = symbol in {"♥", "♦"}
-    face_width = 13 if selected else 9
+    # A card must keep the same footprint when it is selected.  Letting a
+    # selected card grow makes Textual lay out the whole hand again, which is
+    # especially visible while a card is arriving at the table.
+    face_width = 9
     face_style = "bold red" if red else "bold white"
     face = Text()
 
@@ -90,7 +92,7 @@ def _card_panel(
     border = "cyan" if focused else "bright_green" if playable else "bright_yellow" if selected or trump else "red" if red else "white"
     return Panel(
         face, title=title, box=box.ROUNDED, padding=(0, 0),
-        width=15 if selected else 11, height=9 if selected else 7,
+        width=11, height=7,
         border_style=border,
     )
 
@@ -125,6 +127,14 @@ class GameCard(Static):
         self.refresh_card()
 
     def set_card(self, card: Any, *, selected: bool, trump: bool, playable: bool = False) -> None:
+        changed = (
+            card != self.card
+            or selected != self.selected
+            or trump != self.trump
+            or playable != self.playable
+        )
+        if not changed:
+            return
         self.card = card
         self.selected = selected
         self.trump = trump
@@ -159,6 +169,152 @@ class TrickRow(Horizontal):
         self.identity = identity
         self.attack_card = attack_card
         self.defense_card = defense_card
+        self._defense: Any = None
+
+    def set_defense(self, card: Any) -> None:
+        """Replace the covered card only when that table row changed."""
+        if card == self._defense:
+            return
+        self._defense = card
+        self.defense_card.update(_card_panel(card) if card else "")
+
+
+class OpponentFan(Static):
+    """A fixed-size canvas for one opponent's overlapping card fan."""
+
+    shuffle_progress = reactive(0.0)
+
+    def __init__(self, user_id: str):
+        super().__init__("", classes="opponent-fan", markup=False)
+        self.user_id = user_id
+        self._count = 0
+        self._selected: set[int] = set()
+        self._fan_width = 0
+
+    async def on_mount(self) -> None:
+        await self.sync(self._count, self._selected)
+        # The parent may populate the fan before this widget is mounted.  In
+        # that case ``sync`` correctly sees no state transition, but the first
+        # frame still has to be painted.
+        self._paint_fan()
+
+    async def sync(self, count: int, selected: set[int], *, shuffle: bool = False) -> None:
+        count = max(0, count)
+        selected = {index for index in selected if 0 <= index < count}
+        count_changed = count != self._count
+        changed = count_changed or selected != self._selected
+        self._count = count
+        self._selected = selected
+        target_width = max(5, 2 * count + 5)
+        if self._fan_width != target_width:
+            self.styles.width = target_width
+            self._fan_width = target_width
+        if changed:
+            self._paint_fan()
+        if shuffle and not count_changed and count > 1:
+            self.shuffle_progress = 0.001
+            self.animate(
+                "shuffle_progress", 1.0, duration=0.38,
+                easing="in_out_cubic", on_complete=self._finish_shuffle,
+            )
+
+    def watch_shuffle_progress(self, _value: float) -> None:
+        self._paint_fan()
+
+    def _finish_shuffle(self) -> None:
+        self.animate("shuffle_progress", 0.0, duration=0.38, easing="in_out_cubic")
+
+    def _paint_fan(self) -> None:
+        count = self._count
+        if count <= 0:
+            self.update("No cards")
+            return
+        width = max(5, 2 * count + 5)
+        # Leave a top line so lifted cards can move up without changing the
+        # fan widget's size or making the opponent row reflow.
+        rows = [[" "] * width for _ in range(5)]
+        selected_spans: list[tuple[int, int]] = []
+        progress = max(0.0, min(1.0, self.shuffle_progress))
+        # Paint regular cards first. A lifted card is painted last, which also
+        # keeps it visibly above neighbouring, overlapping card backs.
+        ordered_indexes = [index for index in range(count) if index not in self._selected]
+        ordered_indexes.extend(index for index in range(count) if index in self._selected)
+        for index in ordered_indexes:
+            phase = min(1.0, progress * 1.5 - index * 0.09)
+            wave = max(0.0, phase) * max(0.0, 1.0 - max(0.0, phase - 0.58) / 0.42)
+            shift = round(2 * wave * (1 if index % 2 == 0 else -1))
+            start = max(0, min(width - 3, index * 2 + shift))
+            lifted = index in self._selected
+            glyphs = ("╭─╮", f"│{'▲' if lifted else '▧'}│", "╰─╯")
+            top = 0 if lifted else 1
+            for y, line in enumerate(glyphs, top):
+                for x, char in enumerate(line):
+                    rows[y][start + x] = char
+            if lifted:
+                selected_spans.extend((y, start) for y in range(top, top + len(glyphs)))
+        fan = Text("\n".join("".join(row).rstrip() for row in rows), style="bright_blue")
+        line_offsets = []
+        offset = 0
+        for row in rows:
+            line_offsets.append(offset)
+            offset += len("".join(row).rstrip()) + 1
+        for row, start in selected_spans:
+            fan.stylize("bold yellow", line_offsets[row] + start, line_offsets[row] + start + 3)
+        self.update(fan)
+
+
+class OpponentBlock(Vertical):
+    """One opponent's status panel and persistent hand fan."""
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        self.user_panel = Static("", markup=False, classes="opponent-status")
+        self.fan = OpponentFan(user_id)
+        self._status: tuple[Any, ...] | None = None
+        super().__init__(self.user_panel, self.fan, classes="opponent-block")
+
+    def set_status(self, player: dict[str, Any], *, role: str, duty: str) -> None:
+        signature = (
+            player.get("username"), player.get("seat_position"),
+            player.get("cards_remaining"), role, duty,
+        )
+        if signature == self._status:
+            return
+        self._status = signature
+        self.user_panel.update(_player_panel(player, role=role, duty=duty))
+
+
+class BoardCard(GameCard):
+    """A table card that can animate into place after a server snapshot."""
+
+    motion_x = reactive(0.0)
+    motion_y = reactive(0.0)
+
+    def __init__(self, identity: str, card: Any, *, selected: bool = False, source: tuple[int, int] = (0, 4)):
+        super().__init__("table", identity, card, selected=selected)
+        self._offset = source
+        self.styles.offset = source
+
+    def move_to(self, x: int, y: int, *, animate: bool, from_y: int = 4) -> None:
+        target = (max(0, x), max(0, y))
+        if target == self._offset:
+            return
+        if animate:
+            # Attacks keep their horizontal layout slot.  Only the new card
+            # moves vertically, so neighbouring tricks never need a layout
+            # pass for this animation.
+            self.motion_x = float(target[0])
+            self.motion_y = float(from_y)
+            self.animate("motion_y", float(target[1]), duration=0.4, easing="out_cubic")
+        else:
+            self.styles.offset = target
+        self._offset = target
+
+    def watch_motion_x(self, value: float) -> None:
+        self.styles.offset = (round(value), round(self.motion_y))
+
+    def watch_motion_y(self, value: float) -> None:
+        self.styles.offset = (round(self.motion_x), round(value))
 
 
 def _player_panel(player: dict[str, Any], *, role: str = "", duty: str = "Waiting") -> Panel:
@@ -190,36 +346,6 @@ def _player_panel(player: dict[str, Any], *, role: str = "", duty: str = "Waitin
     return Panel(details, box=box.ROUNDED, padding=(0, 1), border_style=border)
 
 
-def _opponent_backs(count: int, selected: set[int] | None = None) -> Text:
-    """Compact overlapping card backs; lifted indexes are shown above the fan."""
-    selected = selected or set()
-    count = max(0, count)
-    visible = count if selected else min(count, 7)
-    backs = Text()
-    if selected:
-        for index in range(visible):
-            backs.append("▴ " if index in selected else "  ", style="bold yellow" if index in selected else "default")
-        backs.append("\n")
-    for index in range(visible):
-        style = "bold yellow" if index in selected else "bright_blue"
-        backs.append("╭─", style=style)
-    if visible:
-        backs.append("╮", style="bold yellow" if visible - 1 in selected else "bright_blue")
-        backs.append("\n")
-        for index in range(visible):
-            backs.append("│▧", style="bold yellow" if index in selected else "bright_blue")
-        backs.append("│", style="bold yellow" if visible - 1 in selected else "bright_blue")
-        backs.append("\n")
-        for index in range(visible):
-            backs.append("╰─", style="bold yellow" if index in selected else "bright_blue")
-        backs.append("╯", style="bold yellow" if visible - 1 in selected else "bright_blue")
-    if count > visible:
-        backs.append(f" +{count - visible}", style="dim")
-    if not count:
-        backs.append("No cards", style="dim")
-    return backs
-
-
 class GameScreen(LiveScreen):
     BINDINGS = [*LiveScreen.BINDINGS]
 
@@ -244,6 +370,11 @@ class GameScreen(LiveScreen):
         self.selected_table_id: str | None = None
         self._card_render_lock = asyncio.Lock()
         self._card_render_revision = 0
+        self._known_table_cards: set[str] = set()
+        self._table_layout_initialized = False
+        self._hand_signal_versions: dict[str, tuple[Any, ...]] = {}
+        self._piles_initialized = False
+        self._pile_signatures: dict[str, Any] = {}
         self.confirm_leave = False
         self._chat_started = False
 
@@ -255,7 +386,8 @@ class GameScreen(LiveScreen):
             yield Static("", id="connection", markup=False, classes="connection")
             yield Static("Loading game snapshot…", id="game-info", markup=False)
             yield Static("", id="turn-info", markup=False, classes="warning")
-            yield Static("", id="player-art")
+            with HorizontalScroll(id="player-art", classes="opponent-board"):
+                pass
             with Horizontal(id="pile-art", classes="pile-art"):
                 pass
             yield Label("Table · Select an attack card to choose a defense target", classes="heading")
@@ -337,6 +469,15 @@ class GameScreen(LiveScreen):
         if "hand_signals" in panels:
             for signal in panels["hand_signals"]:
                 if isinstance(signal, dict) and isinstance(signal.get("user_id"), str):
+                    user_id = signal["user_id"]
+                    previous = self.hand_signals.get(user_id, {})
+                    old_order = previous.get("sort", "dealt")
+                    new_order = signal.get("sort", "dealt")
+                    old_version = previous.get("version", previous.get("updated_at"))
+                    new_version = signal.get("version", signal.get("updated_at"))
+                    self._hand_signal_versions[user_id] = (
+                        old_order != new_order or (old_version is not None and new_version != old_version),
+                    )
                     self.hand_signals[signal["user_id"]] = signal
         if "game" in panels:
             self.lobby_id = self.game.get("lobby_id") or self.lobby_id
@@ -347,9 +488,10 @@ class GameScreen(LiveScreen):
                 return
         if "hand_signals" in panels:
             me = self.client_app.profile.user_id if self.client_app.profile else ""
-            self._render_players(me)
-        if any(key in panels for key in ("game", "players", "hand", "table", "turn", "deck", "events")):
+            self._render_players(me, signals_only=True)
+        if any(key in panels for key in ("game", "players", "hand", "table", "turn", "deck")):
             self._render_game()
+        if any(key in panels for key in ("game", "hand", "deck")):
             self._schedule_hand_signal()
 
     def _render_game(self) -> None:
@@ -522,24 +664,37 @@ class GameScreen(LiveScreen):
     async def _render_piles(self) -> None:
         trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
         pile_art = self.query_one("#pile-art", Horizontal)
-        await pile_art.remove_children()
-        deck = Static(
-            Panel(Text(f"{self.deck.get('deck_remaining', '?')} cards", justify="center"), title="Deck", box=box.ROUNDED, width=18, height=7),
-            classes="pile-item", markup=False,
-        )
-        trump = GameCard("trump", "trump", trump_card) if trump_card else Static(
-            Panel(Text("No trump", justify="center"), title="Trump", box=box.ROUNDED, width=11, height=7),
-            classes="pile-item", markup=False,
-        )
-        if isinstance(trump, GameCard):
-            trump.can_focus = False
-        discard = Static(
-            Panel(Text(f"{self.deck.get('discard_count', '?')} cards", justify="center"), title="Discard", box=box.ROUNDED, width=18, height=7),
-            classes="pile-item", markup=False,
-        )
-        await pile_art.mount(deck, trump, discard)
+        if not self._piles_initialized:
+            self._deck_pile = Static(classes="pile-item", markup=False)
+            self._trump_pile = Static(classes="pile-item", markup=False)
+            self._discard_pile = Static(classes="pile-item", markup=False)
+            await pile_art.mount(self._deck_pile, self._trump_pile, self._discard_pile)
+            self._piles_initialized = True
 
-    def _render_players(self, me: str) -> None:
+        deck_signature = self.deck.get("deck_remaining")
+        if "deck" not in self._pile_signatures or self._pile_signatures["deck"] != deck_signature:
+            self._deck_pile.update(Panel(
+                Text(f"{deck_signature if deck_signature is not None else '?'} cards", justify="center"),
+                title="Deck", box=box.ROUNDED, width=18, height=7,
+            ))
+            self._pile_signatures["deck"] = deck_signature
+
+        trump_signature = trump_card
+        if "trump" not in self._pile_signatures or self._pile_signatures["trump"] != trump_signature:
+            self._trump_pile.update(_card_panel(trump_card, trump=True) if trump_card else Panel(
+                Text("No trump", justify="center"), title="Trump", box=box.ROUNDED, width=11, height=7,
+            ))
+            self._pile_signatures["trump"] = trump_signature.copy() if isinstance(trump_signature, dict) else trump_signature
+
+        discard_signature = self.deck.get("discard_count")
+        if "discard" not in self._pile_signatures or self._pile_signatures["discard"] != discard_signature:
+            self._discard_pile.update(Panel(
+                Text(f"{discard_signature if discard_signature is not None else '?'} cards", justify="center"),
+                title="Discard", box=box.ROUNDED, width=18, height=7,
+            ))
+            self._pile_signatures["discard"] = discard_signature
+
+    def _render_players(self, me: str, *, signals_only: bool = False) -> None:
         pending_ids = {str(identity) for identity in (self.turn.get("pending_ids") or [])}
         passed_ids = {str(identity) for identity in (self.turn.get("passed_ids") or [])}
         attacker_id = str(self.turn.get("attacker_id", ""))
@@ -551,7 +706,28 @@ class GameScreen(LiveScreen):
             actor_id = attacker_id
         elif phase in {"build", "defend"}:
             actor_id = defender_id if open_cards else attacker_id if self.table else ""
-        players = []
+        player_art = self.query_one("#player-art", HorizontalScroll)
+        if signals_only:
+            for player in self.players:
+                identity = str(player.get("user_id", ""))
+                if identity == me:
+                    continue
+                fan = next((widget for widget in player_art.query(OpponentFan) if widget.user_id == identity), None)
+                if fan is None:
+                    continue
+                signal = self.hand_signals.get(identity, {}) if self.game.get("share_hand_signals", True) is not False else {}
+                selected = {
+                    index for index in signal.get("selected", [])
+                    if isinstance(index, int) and not isinstance(index, bool) and index >= 0
+                } if isinstance(signal.get("selected", []), list) else set()
+                count = max(0, int(player.get("cards_remaining") or 0))
+                shuffle = bool(self._hand_signal_versions.pop(identity, (False,))[0])
+                self.run_worker(fan.sync(count, selected, shuffle=shuffle), group=f"fan-{identity}", exclusive=True)
+            return
+        existing_blocks = {
+            block.user_id: block for block in player_art.query(OpponentBlock)
+        }
+        desired_blocks = []
         for player in self.players:
             identity = str(player.get("user_id", ""))
             if identity == me:
@@ -585,14 +761,27 @@ class GameScreen(LiveScreen):
                 index for index in indexes
                 if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < count
             } if isinstance(indexes, list) else set()
-            panel = _player_panel(player, role=role, duty=duty)
-            # Keep each opponent's fan below their name/role, while Columns
-            # places complete opponent blocks side by side when there is room.
-            players.append(Group(panel, _opponent_backs(count, selected)))
-        self.query_one("#player-art", Static).update(
-            Columns(players, equal=True, expand=True, padding=(0, 1))
-            if players else Text("Waiting for players…", style="dim")
-        )
+            block = existing_blocks.get(identity)
+            if block is None:
+                block = OpponentBlock(identity)
+                player_art.mount(block)
+            block.set_status(player, role=role, duty=duty)
+            fan = block.fan
+            if not fan.is_mounted:
+                fan._count = count
+                fan._selected = selected
+            else:
+                self.run_worker(fan.sync(count, selected), group=f"fan-{identity}", exclusive=True)
+            desired_blocks.append(block)
+        for identity, block in existing_blocks.items():
+            if block not in desired_blocks:
+                self.run_worker(block.remove(), group=f"fan-remove-{identity}")
+        for index, block in enumerate(desired_blocks):
+            children = list(player_art.children)
+            if index < len(children) and children[index] is not block:
+                player_art.move_child(block, before=children[index])
+        if not desired_blocks and not list(player_art.children):
+            player_art.mount(Static("Waiting for players…", classes="empty-board"))
 
     def _schedule_card_widgets(self) -> None:
         if not self.is_mounted:
@@ -613,40 +802,77 @@ class GameScreen(LiveScreen):
             )
             hand_area = self.query_one("#hand-cards", HorizontalScroll)
             board_area = self.query_one("#board-cards", HorizontalScroll)
-            await hand_area.remove_children()
-            await board_area.remove_children()
+            old_table_ids = set(self._known_table_cards)
+            next_table_ids = {str(row.get("id", "")) for row in self.table if row.get("id")}
+
+            # Keep table card widgets alive across snapshots; this gives Textual
+            # a stable position to animate from as the layout advances.
+            for child in list(board_area.children):
+                identity = getattr(child, "identity", None)
+                if identity not in next_table_ids:
+                    await child.remove()
+
+            for child in list(hand_area.children):
+                if not isinstance(child, GameCard) or child.identity not in {str(card.get("hand_id", "")) for card in self.hand}:
+                    await child.remove()
 
             trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
             trump_suit = _suit_symbol(trump_card.get("suit")) if isinstance(trump_card, dict) else ""
-            hand_widgets = [
-                GameCard(
-                    "hand", str(card.get("hand_id", "")), card,
-                    selected=str(card.get("hand_id", "")) in self.selected_cards,
+            existing_hand = {widget.identity: widget for widget in hand_area.query(GameCard)}
+            empty_hand = next((c for c in hand_area.children if not isinstance(c, GameCard)), None)
+            if self.hand and empty_hand:
+                await empty_hand.remove()
+            hand_widgets = []
+            for card in self.hand:
+                identity = str(card.get("hand_id", ""))
+                widget = existing_hand.get(identity)
+                if widget is None:
+                    widget = GameCard("hand", identity, card)
+                    await hand_area.mount(widget)
+                widget.set_card(
+                    card, selected=identity in self.selected_cards,
                     trump=bool(trump_suit) and _suit_symbol(card.get("suit")) == trump_suit,
-                    playable=str(card.get("hand_id", "")) in self.playable_hand_ids,
-                ) for card in self.hand
-            ]
-            if hand_widgets:
-                await hand_area.mount(*hand_widgets)
-            else:
+                    playable=identity in self.playable_hand_ids,
+                )
+                hand_widgets.append(widget)
+            if not hand_widgets and not list(hand_area.children):
                 await hand_area.mount(Static("Your hand is empty", classes="empty-board"))
+            for index, widget in enumerate(hand_widgets):
+                if index < len(hand_area.children) and hand_area.children[index] is not widget:
+                    hand_area.move_child(widget, before=hand_area.children[index])
 
+            existing_board = {
+                child.identity: child for child in board_area.children
+                if isinstance(child, TrickRow)
+            }
             trick_rows = []
-            for row in self.table:
+            for row_index, row in enumerate(self.table):
                 identity = str(row.get("id", ""))
-                attack = GameCard(
-                    "table", identity, row.get("attack"),
-                    selected=identity == self.selected_table_id,
-                )
-                defense_card = row.get("defense")
-                defense = Static(
-                    _card_panel(defense_card) if defense_card else "",
-                    classes="table-card",
-                )
-                trick_rows.append(TrickRow(identity, attack, defense))
-            if trick_rows:
-                await board_area.mount(*trick_rows)
-            else:
+                trick = existing_board.get(identity)
+                is_new = identity not in old_table_ids
+                if trick is None:
+                    attack = BoardCard(identity, row.get("attack"), selected=identity == self.selected_table_id)
+                    defense = Static("", classes="table-card")
+                    trick = TrickRow(identity, attack, defense)
+                    await board_area.mount(trick)
+                attack = trick.attack_card
+                attack.set_card(row.get("attack"), selected=identity == self.selected_table_id, trump=False)
+                trick.set_defense(row.get("defense"))
+                rows_now = [c for c in board_area.children if isinstance(c, TrickRow)]
+                if row_index < len(rows_now) and rows_now[row_index] is not trick:
+                    board_area.move_child(trick, before=rows_now[row_index])
+                trick_rows.append(trick)
+                if isinstance(attack, BoardCard):
+                    # Keep attacks in the left slot.  A raised defense sits
+                    # to their right, leaving both card frames intact.
+                    attack.move_to(
+                        0, 0,
+                        animate=self._table_layout_initialized and is_new,
+                        from_y=4 if is_new else 0,
+                    )
+            self._known_table_cards = next_table_ids
+            self._table_layout_initialized = True
+            if not trick_rows:
                 await board_area.mount(Static("No cards on the table", classes="empty-board"))
 
             if focused_card:
@@ -716,8 +942,7 @@ class GameScreen(LiveScreen):
         self.query_one("#send-chat", Button).disabled = self.busy or self.stale
         self.query_one("#rematch", Button).disabled = self.busy or self.stale
         self.query_one("#confirm-leave", Button).disabled = self.busy or self.stale
-        if self.is_mounted and self.game:
-            self._render_game()
+        self._sync_card_action_buttons()
 
     @on(GameCard.Activated)
     def card_activated(self, event: GameCard.Activated) -> None:

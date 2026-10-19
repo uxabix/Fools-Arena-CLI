@@ -14,6 +14,7 @@ from fools_client.games import GameService, LobbyChatService
 from fools_client.live import SnapshotLoader
 from fools_client.realtime import Subscription
 from fools_client.ui.app import FoolsApp
+from fools_client.ui.game import GameCard, OpponentFan, _card_panel
 from textual.app import App
 
 
@@ -179,6 +180,48 @@ class ApiClientTests(unittest.TestCase):
         self.assertIn(f"csrftoken={'a' * 32}", request.headers["Cookie"])
         run_immediate(client._http.aclose())
 
+
+class IncrementalGameRenderTests(unittest.TestCase):
+    def test_selected_card_keeps_the_same_footprint(self):
+        card = {"rank": "ace", "suit": "hearts"}
+
+        normal = _card_panel(card)
+        selected = _card_panel(card, selected=True)
+
+        self.assertEqual((normal.width, normal.height), (selected.width, selected.height))
+
+    def test_unchanged_card_is_not_repainted(self):
+        payload = {"rank": "ace", "suit": "spades"}
+        card = GameCard("hand", HAND_ID, payload)
+
+        with patch.object(card, "refresh_card") as refresh:
+            card.set_card(payload.copy(), selected=False, trump=False)
+
+        refresh.assert_not_called()
+
+    def test_unchanged_opponent_fan_is_not_repainted(self):
+        fan = OpponentFan("opponent")
+
+        with patch.object(fan, "_paint_fan") as paint:
+            run_immediate(fan.sync(4, {1}))
+            self.assertEqual(paint.call_count, 1)
+            paint.reset_mock()
+            run_immediate(fan.sync(4, {1}))
+
+        paint.assert_not_called()
+
+    def test_selected_opponent_card_is_visibly_lifted(self):
+        fan = OpponentFan("opponent")
+        fan._count = 3
+        fan._selected = {1}
+
+        with patch.object(fan, "update") as update:
+            fan._paint_fan()
+
+        self.assertIn("▲", str(update.call_args.args[0]))
+
+
+class ApiClientResponseTests(unittest.TestCase):
     def test_api_error_preserves_status_and_server_code(self):
         async def reject(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

@@ -82,6 +82,21 @@ Button {
     margin: 1 0;
 }
 
+#player-art {
+    height: 12;
+    min-height: 12;
+    max-height: 12;
+}
+
+.opponent-board {
+    width: 1fr;
+    height: 12;
+    min-height: 12;
+    align-horizontal: center;
+    align-vertical: top;
+    padding: 0 1;
+}
+
 #pile-art {
     width: 1fr;
     align-horizontal: center;
@@ -92,6 +107,28 @@ Button {
     width: auto;
     height: 7;
     margin: 0 1;
+}
+
+.opponent-block {
+    height: 12;
+    min-height: 12;
+    width: 24;
+    min-width: 20;
+    margin: 0 1;
+    align-horizontal: center;
+}
+
+.opponent-status {
+    width: 1fr;
+    height: 7;
+}
+
+.opponent-fan {
+    height: 5;
+    min-height: 5;
+    width: auto;
+    align-horizontal: center;
+    margin: 0;
 }
 
 .card-board {
@@ -123,15 +160,19 @@ Button {
 }
 
 .game-card.selected {
-    width: 15;
-    height: 9;
+    /* Keep the hand's geometry stable; selection is represented by the
+       card's border and title, not by making every sibling move aside. */
+    offset: 0 -1;
 }
 
 .trick-row {
-    width: 1fr;
+    /* The raised defense overlaps the attack from the right like a card pair,
+       while the enclosing row still leaves room for both panels. */
+    width: 24;
+    min-width: 24;
     layers: cards defense;
     height: 9;
-    align: center middle;
+    align: left middle;
     margin: 0 1 0 0;
 }
 
