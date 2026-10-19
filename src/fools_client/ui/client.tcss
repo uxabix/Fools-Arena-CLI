@@ -1,0 +1,119 @@
+Screen {
+    align: center top;
+}
+
+.form, .detail, .browser {
+    width: 1fr;
+    height: 1fr;
+    padding: 1 2;
+}
+
+.form {
+    max-width: 90;
+}
+
+.heading {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+Static, Label {
+    height: auto;
+    width: 1fr;
+}
+
+Input, Select {
+    margin-bottom: 1;
+}
+
+.rules {
+    height: auto;
+}
+
+Checkbox {
+    width: 1fr;
+}
+
+.actions {
+    grid-size: 3;
+    grid-columns: 1fr 1fr 1fr;
+    grid-rows: 3;
+    grid-gutter: 1;
+    height: auto;
+    margin: 1 0;
+}
+
+Button {
+    width: 1fr;
+    min-width: 0;
+}
+
+.connection {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+.muted {
+    color: $text-muted;
+}
+
+.warning {
+    color: $warning;
+    margin: 1 0;
+}
+
+#notice {
+    min-height: 1;
+    margin: 1 0;
+}
+
+#notice.error {
+    color: $error;
+}
+
+#lobbies {
+    height: 1fr;
+    min-height: 5;
+}
+
+#players {
+    height: 10;
+    margin: 1 0;
+}
+
+#table, #hand, #chat {
+    height: 10;
+    margin: 1 0;
+}
+
+#chat {
+    height: 12;
+}
+
+.game-actions {
+    grid-size: 4;
+    grid-columns: 1fr 1fr 1fr 1fr;
+}
+
+.chat-entry {
+    height: auto;
+    width: 1fr;
+    align: left middle;
+}
+
+.chat-entry Input {
+    width: 1fr;
+}
+
+.chat-entry Button {
+    width: auto;
+    min-width: 14;
+}
+
+#confirmation {
+    display: none;
+    height: auto;
+    border: round $warning;
+    padding: 0 1;
+}
