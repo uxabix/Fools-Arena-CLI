@@ -81,3 +81,7 @@ Use HTTPS/WSS outside trusted local development. The client does not automatical
 ## Existing server integration
 
 The client uses the existing routes documented in `docs/server-notes.md` and `docs/realtime.md`. The adjacent `Django-Durak` repository is treated as read-only by this project unless the owner explicitly requests a server change.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
