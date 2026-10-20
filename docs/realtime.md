@@ -29,7 +29,7 @@ The game screen separately subscribes to the lobby channel for chat. Screen navi
 3. Treat events as requests to reload affected panels; never apply moves locally.
 4. Compare new panel data and emit only changes.
 
-Chat events reload chat history. Lobby events reload lobby data. Game events reload the viewer's game snapshot. Unknown valid events cause a full subscription refresh. Hand-signal events are ignored because gestures are out of scope.
+Chat events reload chat history. Lobby events reload lobby data. Game events reload the viewer's game snapshot. Unknown valid events cause a full subscription refresh. Hand-signal events update opponent card-back hints directly and do not reload or change the game snapshot.
 
 Nearby events are coalesced for 50 ms. The queue is bounded without silently dropping events. A full snapshot comparison also runs every 30 seconds to recover from missed notifications. Reconnecting always triggers a fresh snapshot.
 

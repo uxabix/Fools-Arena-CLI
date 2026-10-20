@@ -29,7 +29,7 @@ Escape returns to the lobby list without leaving the lobby. Ctrl+R reloads the l
 
 ## Game table and chat
 
-The game screen displays players, table cards, the current player's hand, turn information, deck and discard data, and lobby chat. Select hand cards with Space. To defend, select one hand card and a table attack row. Commands are sent to the server; the client does not apply moves locally. A successful command triggers a fresh snapshot, while a rule error is shown without replacing the displayed state.
+The game screen displays players, table cards, the current player's hand, turn information, deck and discard data, and lobby chat. Select hand cards with Space. Use **Sort hand** to cycle through suit with trump left/right, rank low/high, and dealt/reversed order. Sorting changes only the displayed copy; game commands retain the hand identities and order from the latest server snapshot. When the lobby allows hand signals, the client shares the sort mode and selected card positions with other players; card identities and faces are not sent in those signals. A short card glide marks each reorder. To defend, select one hand card and a table attack row. Commands are sent to the server; the client does not apply moves locally. A successful command triggers a fresh snapshot, while a rule error is shown without replacing the displayed state.
 
 Lobby chat is available before and during a game. Chat and game state synchronize through WebSocket events and server snapshots. A rematch is opened when the server creates its next game.
 

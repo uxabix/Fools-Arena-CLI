@@ -106,7 +106,7 @@ class SnapshotLoaderTests(unittest.TestCase):
     def test_game_projection_keeps_private_hand_separate(self):
         loader = SnapshotLoader(None, USER_ID)  # type: ignore[arg-type]
         game = {
-            "id": GAME_ID,
+            "id": GAME_ID, "lobby_id": LOBBY_ID,
             "players": [
                 {"user_id": USER_ID, "username": "me", "hand": [{"id": CARD_ID, "hand_id": HAND_ID}]},
                 {"user_id": "other", "username": "opponent", "hand": None},
@@ -126,6 +126,7 @@ class SnapshotLoaderTests(unittest.TestCase):
         self.assertEqual(panels["hand"], [{"id": CARD_ID, "hand_id": HAND_ID}])
         self.assertNotIn("hand", panels["players"][0])
         self.assertNotIn("trump_card", panels["game"])
+        self.assertEqual(panels["game"]["lobby_id"], game["lobby_id"])
         self.assertEqual(panels["turn"], game["runtime"])
         self.assertEqual(panels["table"], game["table"])
 

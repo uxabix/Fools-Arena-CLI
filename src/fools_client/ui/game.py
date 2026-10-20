@@ -12,7 +12,7 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, Horizontal, HorizontalScroll, Vertical, VerticalScroll
+from textual.containers import Grid, Horizontal, HorizontalScroll, Vertical, VerticalGroup, VerticalScroll
 from textual.events import Click
 from textual.message import Message
 from textual.reactive import reactive
@@ -34,6 +34,23 @@ _RANK_SYMBOLS = {
     "joker": "JK", "two": "2", "three": "3", "four": "4", "five": "5",
     "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10", "10": "10",
 }
+_HAND_SORTS = (
+    "suit-left", "suit-right", "rank-ltr", "rank-rtl", "dealt", "dealt-rev",
+)
+_HAND_SORT_LABELS = {
+    "suit-left": "Suit · trump left",
+    "suit-right": "Suit · trump right",
+    "rank-ltr": "Rank · low to high",
+    "rank-rtl": "Rank · high to low",
+    "dealt": "Dealt",
+    "dealt-rev": "Dealt · reversed",
+}
+_SUIT_ORDER = {"♠": 0, "♥": 1, "♦": 2, "♣": 3}
+_RANK_VALUES = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "jack": 11, "queen": 12, "king": 13, "ace": 14,
+}
 
 
 def _suit_symbol(value: Any) -> str:
@@ -46,9 +63,48 @@ def _rank_symbol(value: Any) -> str:
     return _RANK_SYMBOLS.get(rank.lower(), rank)
 
 
+def _card_value(card: dict[str, Any]) -> float:
+    value = card.get("value")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return float(_RANK_VALUES.get(str(card.get("rank", "")).lower(), 0))
+
+
+def _sorted_hand(
+    hand: list[dict[str, Any]], mode: str, trump_suit: Any,
+) -> list[dict[str, Any]]:
+    """Sort a display copy; game commands continue to use server hand order."""
+    cards = list(hand)
+    if mode == "dealt":
+        return cards
+    if mode == "dealt-rev":
+        return list(reversed(cards))
+    trump = _suit_symbol(trump_suit) if trump_suit else ""
+
+    def suit_key(card: dict[str, Any], *, trump_right: bool = False) -> int:
+        suit = _suit_symbol(card.get("suit"))
+        if trump and suit == trump:
+            return 8 if trump_right else -1
+        return _SUIT_ORDER.get(suit, 4)
+
+    if mode in {"suit-left", "suit-right"}:
+        cards.sort(key=lambda card: (
+            suit_key(card, trump_right=mode == "suit-right"),
+            _card_value(card), suit_key(card), str(card.get("id", "")),
+        ))
+    else:
+        cards.sort(key=lambda card: (
+            _card_value(card), suit_key(card), str(card.get("id", "")),
+        ))
+        if mode == "rank-rtl":
+            cards.reverse()
+    return cards
+
+
 def _card_panel(
     card: Any, *, selected: bool = False, trump: bool = False, face_down: bool = False,
     focused: bool = False, playable: bool = False, error_highlight: bool = False,
+    actor_name: str | None = None, actor_progress: float = 0.0,
 ) -> Panel:
     if face_down:
         face = Text("╱ ▒ ▒ ╲\n│ ▒ ▒ │\n╲ ▒ ▒ ╱", style="bright_blue", justify="center")
@@ -92,7 +148,19 @@ def _card_panel(
     line(right=symbol)
     face.append("\n")
     line(right=rank)
-    title = Text("INVALID", style="bold bright_red") if error_highlight else "TRUMP" if trump else None
+    if error_highlight:
+        title = Text("INVALID", style="bold bright_red")
+    elif actor_name:
+        # Rich has no terminal alpha channel; blend the name's foreground
+        # between a subdued and bright color to produce a smooth fade.
+        progress = max(0.0, min(1.0, actor_progress))
+        start, end = (18, 18, 18), (255, 244, 150)
+        color = "#" + "".join(
+            f"{round(a + (b - a) * progress):02x}" for a, b in zip(start, end)
+        )
+        title = Text(actor_name, style=f"bold {color}")
+    else:
+        title = "TRUMP" if trump else None
     border = (
         "bright_red" if error_highlight else "cyan" if focused else
         "bright_green" if playable else "bright_yellow" if selected or trump else
@@ -134,6 +202,7 @@ class GameCard(Static):
     can_focus = True
     selection_lift = reactive(0.0)
     shake_progress = reactive(0.0)
+    sort_progress = reactive(0.0)
     BINDINGS = [
         Binding("enter", "activate", "Select card"),
         Binding("space", "activate", "Select card"),
@@ -159,6 +228,7 @@ class GameCard(Static):
         self.error_highlight = False
         self._error_animation_generation = 0
         self._error_base_offset = None
+        self._sort_direction = 1
         # A restored screen may already contain a selected card.  Put it in
         # its final position without playing an animation before it is shown.
         self.selection_lift = -1.0 if selected and area == "hand" else 0.0
@@ -200,8 +270,24 @@ class GameCard(Static):
         # Hand cards normally have no positional offset.  Moving only this
         # widget gives selection a visible motion while preserving every
         # card's footprint and preventing sibling reflow.
+        self._refresh_hand_offset(value)
+
+    def animate_sort(self, index: int) -> None:
+        """Give each card a brief alternating glide when the hand is reordered."""
+        self._sort_direction = 1 if index % 2 == 0 else -1
+        if self.is_mounted:
+            self.sort_progress = 0.0
+            self.animate("sort_progress", 1.0, duration=0.34, easing="in_out_cubic")
+
+    def watch_sort_progress(self, _value: float) -> None:
+        self._refresh_hand_offset(self.selection_lift)
+
+    def _refresh_hand_offset(self, lift: float) -> None:
         if self.area == "hand" and not self.error_highlight:
-            self.styles.offset = (0, round(value))
+            wave = math.sin(self.sort_progress * math.pi)
+            horizontal = round(wave * 2 * self._sort_direction)
+            vertical = round(lift - wave)
+            self.styles.offset = (horizontal, vertical)
 
     def refresh_card(self) -> None:
         self.update(_card_panel(
@@ -260,19 +346,78 @@ class GameCard(Static):
 
 
 class TrickRow(Horizontal):
-    def __init__(self, identity: str, attack_card: GameCard, defense_card: Static):
+    def __init__(self, identity: str, attack_card: GameCard, defense_card: "BoardDefenseCard"):
         super().__init__(attack_card, defense_card, classes="trick-row")
         self.identity = identity
         self.attack_card = attack_card
         self.defense_card = defense_card
         self._defense: Any = None
+        # The overlay belongs to the row only after a defense is actually
+        # played. A blank overlay still covers part of the attack card.
+        self.defense_card.display = False
 
     def set_defense(self, card: Any) -> None:
         """Replace the covered card only when that table row changed."""
         if card == self._defense:
             return
         self._defense = card
-        self.defense_card.update(_card_panel(card) if card else "")
+        self.defense_card.display = bool(card)
+        self.defense_card.set_card(card)
+
+
+class BoardDefenseCard(Static):
+    """A defense card with the same temporary actor label as an attack card."""
+
+    actor_progress = reactive(0.0)
+
+    def __init__(self):
+        super().__init__("", classes="table-card", markup=False)
+        self.card: Any = None
+        self.actor_name: str | None = None
+        self._actor_animation_generation = 0
+
+    def set_card(self, card: Any) -> None:
+        self.card = card
+        self.refresh_card()
+
+    def show_actor(self, username: str) -> None:
+        if not username:
+            return
+        self._actor_animation_generation += 1
+        generation = self._actor_animation_generation
+        self.actor_name = display_text(username)
+        self.actor_progress = 0.0
+        self.refresh_card()
+        self.animate(
+            "actor_progress", 1.0, duration=0.45, easing="out_cubic",
+            on_complete=lambda: self._hold_actor(generation),
+        )
+
+    def watch_actor_progress(self, _progress: float) -> None:
+        self.refresh_card()
+
+    def _hold_actor(self, generation: int) -> None:
+        if generation == self._actor_animation_generation and self.is_mounted:
+            self.set_timer(2.4, lambda: self._fade_actor(generation))
+
+    def _fade_actor(self, generation: int) -> None:
+        if generation != self._actor_animation_generation or not self.is_mounted:
+            return
+        self.animate(
+            "actor_progress", 0.0, duration=0.7, easing="in_out_cubic",
+            on_complete=lambda: self._clear_actor(generation),
+        )
+
+    def _clear_actor(self, generation: int) -> None:
+        if generation != self._actor_animation_generation:
+            return
+        self.actor_name = None
+        self.refresh_card()
+
+    def refresh_card(self) -> None:
+        self.update(_card_panel(
+            self.card, actor_name=self.actor_name, actor_progress=self.actor_progress,
+        ) if self.card else "")
 
 
 class OpponentFan(Static):
@@ -385,11 +530,49 @@ class BoardCard(GameCard):
 
     motion_x = reactive(0.0)
     motion_y = reactive(0.0)
+    actor_progress = reactive(0.0)
 
     def __init__(self, identity: str, card: Any, *, selected: bool = False, source: tuple[int, int] = (0, 4)):
+        self.actor_name: str | None = None
+        self._actor_animation_generation = 0
         super().__init__("table", identity, card, selected=selected)
         self._offset = source
         self.styles.offset = source
+
+    def show_actor(self, username: str) -> None:
+        """Fade an opponent's name onto this card, hold it, then fade it away."""
+        if not username:
+            return
+        self._actor_animation_generation += 1
+        generation = self._actor_animation_generation
+        self.actor_name = display_text(username)
+        self.actor_progress = 0.0
+        self.refresh_card()
+        self.animate(
+            "actor_progress", 1.0, duration=0.45, easing="out_cubic",
+            on_complete=lambda: self._hold_actor(generation),
+        )
+
+    def watch_actor_progress(self, _progress: float) -> None:
+        self.refresh_card()
+
+    def _hold_actor(self, generation: int) -> None:
+        if generation == self._actor_animation_generation and self.is_mounted:
+            self.set_timer(2.4, lambda: self._fade_actor(generation))
+
+    def _fade_actor(self, generation: int) -> None:
+        if generation != self._actor_animation_generation or not self.is_mounted:
+            return
+        self.animate(
+            "actor_progress", 0.0, duration=0.7, easing="in_out_cubic",
+            on_complete=lambda: self._clear_actor(generation),
+        )
+
+    def _clear_actor(self, generation: int) -> None:
+        if generation != self._actor_animation_generation:
+            return
+        self.actor_name = None
+        self.refresh_card()
 
     def move_to(self, x: int, y: int, *, animate: bool, from_y: int = 4) -> None:
         target = (max(0, x), max(0, y))
@@ -411,6 +594,14 @@ class BoardCard(GameCard):
 
     def watch_motion_y(self, value: float) -> None:
         self.styles.offset = (round(self.motion_x), round(value))
+
+    def refresh_card(self) -> None:
+        self.update(_card_panel(
+            self.card, selected=self.selected, trump=self.trump,
+            focused=self.has_focus, playable=self.playable,
+            error_highlight=self.error_highlight,
+            actor_name=self.actor_name, actor_progress=self.actor_progress,
+        ))
 
 
 def _player_panel(player: dict[str, Any], *, role: str = "", duty: str = "Waiting") -> Panel:
@@ -458,17 +649,20 @@ class GameScreen(LiveScreen):
         self.deck: dict[str, Any] = {}
         self.events: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
+        self.hand_sort = "suit-left"
         self.hand_signals: dict[str, dict[str, Any]] = {}
+        self._hand_signal_key: tuple[str, tuple[int, ...]] | None = None
+        self._hand_signal_revision = 0
         self.playable_hand_ids: set[str] = set()
         self.selected_cards: set[str] = set()
-        self._hand_signal_key: tuple[int, ...] | None = None
-        self._hand_signal_revision = 0
         self.selected_table_id: str | None = None
         self._card_render_lock = asyncio.Lock()
         self._card_render_revision = 0
+        self._rendered_hand_sort: str | None = None
         self._known_table_cards: set[str] = set()
+        self._event_history_ready = False
+        self._pending_actor_labels: dict[tuple[str, str], str] = {}
         self._table_layout_initialized = False
-        self._hand_signal_versions: dict[str, tuple[Any, ...]] = {}
         self._piles_initialized = False
         self._pile_signatures: dict[str, Any] = {}
         self.confirm_leave = False
@@ -491,6 +685,7 @@ class GameScreen(LiveScreen):
             with HorizontalScroll(id="board-cards", classes="card-board"):
                 pass
             yield Label("Your hand · Select cards to attack or defend", classes="heading")
+            yield Button(_HAND_SORT_LABELS[self.hand_sort], id="sort-hand", variant="default", disabled=True)
             with HorizontalScroll(id="hand-cards", classes="hand-cards"):
                 pass
             yield Static("", id="selection", markup=False, classes="muted")
@@ -510,7 +705,10 @@ class GameScreen(LiveScreen):
                 with Grid(classes="actions"):
                     yield Button("Confirm leave", id="confirm-leave", variant="error")
                     yield Button("Stay", id="cancel-leave")
-            with VerticalScroll(id="chat-panel"):
+            # The outer screen already scrolls. VerticalGroup deliberately
+            # sizes itself to its contents, so chat cannot claim a spare
+            # fractional screen height below the action buttons.
+            with VerticalGroup(id="chat-panel"):
                 yield Label("Lobby chat", classes="heading")
                 yield Static("Waiting for chat snapshot…", id="chat-connection", markup=False, classes="connection")
                 yield SnapshotTable(id="chat")
@@ -563,25 +761,33 @@ class GameScreen(LiveScreen):
                 self.query_one("#chat-connection", Static).update(display_text(error))
 
     def apply_panels(self, panels: dict[str, Any]) -> None:
+        previous_events = self.events
         for key, attribute in (
             ("game", "game"), ("players", "players"), ("hand", "hand"),
             ("table", "table"), ("turn", "turn"), ("deck", "deck"), ("events", "events"),
         ):
             if key in panels:
                 setattr(self, attribute, panels[key])
+        if "events" in panels:
+            if self._event_history_ready:
+                self._queue_new_actor_labels(previous_events, self.events)
+            else:
+                # A newly opened client should not animate old actions from
+                # the server's bounded public history.
+                self._event_history_ready = True
         if "hand_signals" in panels:
-            for signal in panels["hand_signals"]:
-                if isinstance(signal, dict) and isinstance(signal.get("user_id"), str):
-                    user_id = signal["user_id"]
-                    previous = self.hand_signals.get(user_id, {})
-                    old_order = previous.get("sort", "dealt")
-                    new_order = signal.get("sort", "dealt")
-                    old_version = previous.get("version", previous.get("updated_at"))
-                    new_version = signal.get("version", signal.get("updated_at"))
-                    self._hand_signal_versions[user_id] = (
-                        old_order != new_order or (old_version is not None and new_version != old_version),
-                    )
-                    self.hand_signals[signal["user_id"]] = signal
+            signals = panels["hand_signals"]
+            if isinstance(signals, list):
+                changed_users = set()
+                for signal in signals:
+                    if not isinstance(signal, dict) or not isinstance(signal.get("user_id"), str):
+                        continue
+                    identity = signal["user_id"]
+                    previous = self.hand_signals.get(identity, {})
+                    if previous.get("sort") != signal.get("sort"):
+                        changed_users.add(identity)
+                    self.hand_signals[identity] = signal
+                self._render_hand_signals(changed_users)
         if "game" in panels:
             self.lobby_id = self.game.get("lobby_id") or self.lobby_id
             self._start_chat()
@@ -589,13 +795,109 @@ class GameScreen(LiveScreen):
             if next_game and next_game != self.game_id:
                 self.go(GameScreen(next_game, self.lobby_id, "The rematch has started; the new table is open."))
                 return
-        if "hand_signals" in panels:
-            me = self.client_app.profile.user_id if self.client_app.profile else ""
-            self._render_players(me, signals_only=True)
         if any(key in panels for key in ("game", "players", "hand", "table", "turn", "deck")):
             self._render_game()
-        if any(key in panels for key in ("game", "hand", "deck")):
+        if any(key in panels for key in ("game", "hand")):
             self._schedule_hand_signal()
+
+    def _render_hand_signals(self, shuffled_users: set[str] | None = None) -> None:
+        if not self.is_mounted:
+            return
+        me = str(self.client_app.profile.user_id) if self.client_app.profile else ""
+        for block in self.query(OpponentBlock):
+            if block.user_id == me:
+                continue
+            signal = self.hand_signals.get(block.user_id, {})
+            selected = signal.get("selected", [])
+            selected = {
+                index for index in selected
+                if isinstance(index, int) and not isinstance(index, bool) and index >= 0
+            } if isinstance(selected, list) else set()
+            raw_count = next((
+                player.get("cards_remaining") or 0 for player in self.players
+                if str(player.get("user_id", "")) == block.user_id
+            ), 0)
+            try:
+                count = max(0, int(raw_count))
+            except (TypeError, ValueError):
+                count = 0
+            self.run_worker(
+                block.fan.sync(
+                    count, selected,
+                    shuffle=bool(shuffled_users and block.user_id in shuffled_users),
+                ),
+                group=f"fan-{block.user_id}", exclusive=True,
+            )
+
+    def _schedule_hand_signal(self) -> None:
+        if not self.is_mounted or self.game.get("share_hand_signals", True) is False:
+            return
+        display_hand = self._display_hand()
+        selected = tuple(
+            index for index, card in enumerate(display_hand)
+            if str(card.get("hand_id", "")) in self.selected_cards
+        )
+        key = (self.hand_sort, selected)
+        if key == self._hand_signal_key:
+            return
+        self._hand_signal_key = key
+        self._hand_signal_revision += 1
+        self.run_worker(
+            self._publish_hand_signal(self._hand_signal_revision, key),
+            group="hand-signal", exclusive=True,
+        )
+
+    async def _publish_hand_signal(
+        self, revision: int, key: tuple[str, tuple[int, ...]],
+    ) -> None:
+        # Coalesce quick selection and sort changes below the server's 20/s limit.
+        await asyncio.sleep(0.12)
+        if revision != self._hand_signal_revision or not self.is_mounted:
+            return
+        try:
+            await SocketFeed(self.client_app.client).send(
+                Subscription("game", self.game_id),
+                {"action": "hand_signal", "sort": key[0], "selected": list(key[1])},
+            )
+        except ClientError:
+            # Hand tells are optional display hints and must not interrupt play.
+            return
+
+    def _queue_new_actor_labels(
+        self, previous: list[dict[str, Any]], current: list[dict[str, Any]],
+    ) -> None:
+        """Associate newly announced played cards with their table rows."""
+        common = 0
+        while common < min(len(previous), len(current)) and previous[common] == current[common]:
+            common += 1
+        if common == 0 and previous and current:
+            # The server keeps a bounded event list. Once it is full, each
+            # append drops the oldest entry, so find the retained overlap.
+            for overlap in range(min(len(previous), len(current)), 0, -1):
+                if previous[-overlap:] == current[:overlap]:
+                    common = overlap
+                    break
+        new_events = current[common:]
+        me = str(self.client_app.profile.user_id) if self.client_app.profile else ""
+        for event in new_events:
+            if not isinstance(event, dict) or str(event.get("user_id", "")) == me:
+                continue
+            action = event.get("action")
+            if action not in {"attack", "transfer", "defend"}:
+                continue
+            username = str(event.get("username") or "")
+            cards = event.get("cards")
+            if not username or not isinstance(cards, list):
+                continue
+            card_ids = {
+                str(card.get("id")) for card in cards
+                if isinstance(card, dict) and card.get("id") is not None
+            }
+            card_field = "defense" if action == "defend" else "attack"
+            for row in self.table:
+                card = row.get(card_field)
+                if isinstance(card, dict) and str(card.get("id")) in card_ids:
+                    self._pending_actor_labels[(str(row.get("id", "")), card_field)] = username
 
     def _render_game(self) -> None:
         status = {"in_progress": "In progress", "finished": "Game finished"}.get(
@@ -662,6 +964,7 @@ class GameScreen(LiveScreen):
             button.display = visible
             button.disabled = self.busy or self.stale or not can_play
         self.query_one("#attack", Button).label = "Attack" if phase == "between" else "Throw in"
+        self.query_one("#sort-hand", Button).disabled = self.busy or self.stale
         self._sync_card_action_buttons()
         self.query_one("#leave", Button).disabled = self.busy or self.stale or not can_play
         self.query_one("#rematch", Button).display = bool(self.game.get("can_rematch"))
@@ -834,7 +1137,7 @@ class GameScreen(LiveScreen):
             ))
             self._pile_signatures["discard"] = discard_signature
 
-    def _render_players(self, me: str, *, signals_only: bool = False) -> None:
+    def _render_players(self, me: str) -> None:
         pending_ids = {str(identity) for identity in (self.turn.get("pending_ids") or [])}
         passed_ids = {str(identity) for identity in (self.turn.get("passed_ids") or [])}
         attacker_id = str(self.turn.get("attacker_id", ""))
@@ -847,23 +1150,6 @@ class GameScreen(LiveScreen):
         elif phase in {"build", "defend"}:
             actor_id = defender_id if open_cards else attacker_id if self.table else ""
         player_art = self.query_one("#player-art", HorizontalScroll)
-        if signals_only:
-            for player in self.players:
-                identity = str(player.get("user_id", ""))
-                if identity == me:
-                    continue
-                fan = next((widget for widget in player_art.query(OpponentFan) if widget.user_id == identity), None)
-                if fan is None:
-                    continue
-                signal = self.hand_signals.get(identity, {}) if self.game.get("share_hand_signals", True) is not False else {}
-                selected = {
-                    index for index in signal.get("selected", [])
-                    if isinstance(index, int) and not isinstance(index, bool) and index >= 0
-                } if isinstance(signal.get("selected", []), list) else set()
-                count = max(0, int(player.get("cards_remaining") or 0))
-                shuffle = bool(self._hand_signal_versions.pop(identity, (False,))[0])
-                self.run_worker(fan.sync(count, selected, shuffle=shuffle), group=f"fan-{identity}", exclusive=True)
-            return
         existing_blocks = {
             block.user_id: block for block in player_art.query(OpponentBlock)
         }
@@ -895,18 +1181,18 @@ class GameScreen(LiveScreen):
                 duty = "Out"
             else:
                 duty = "Waiting"
-            signal = self.hand_signals.get(identity, {}) if self.game.get("share_hand_signals", True) is not False else {}
-            indexes = signal.get("selected", [])
-            selected = {
-                index for index in indexes
-                if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < count
-            } if isinstance(indexes, list) else set()
             block = existing_blocks.get(identity)
             if block is None:
                 block = OpponentBlock(identity)
                 player_art.mount(block)
             block.set_status(player, role=role, duty=duty)
             fan = block.fan
+            signal = self.hand_signals.get(identity, {})
+            selected = signal.get("selected", [])
+            selected = {
+                index for index in selected
+                if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < count
+            } if isinstance(selected, list) else set()
             if not fan.is_mounted:
                 fan._count = count
                 fan._selected = selected
@@ -959,11 +1245,19 @@ class GameScreen(LiveScreen):
             trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
             trump_suit = _suit_symbol(trump_card.get("suit")) if isinstance(trump_card, dict) else ""
             existing_hand = {widget.identity: widget for widget in hand_area.query(GameCard)}
+            sort_changed = (
+                self._rendered_hand_sort is not None
+                and self._rendered_hand_sort != self.hand_sort
+            )
             empty_hand = next((c for c in hand_area.children if not isinstance(c, GameCard)), None)
             if self.hand and empty_hand:
                 await empty_hand.remove()
             hand_widgets = []
-            for card in self.hand:
+            display_hand = _sorted_hand(
+                self.hand, self.hand_sort,
+                trump_card.get("suit") if isinstance(trump_card, dict) else None,
+            )
+            for card in display_hand:
                 identity = str(card.get("hand_id", ""))
                 widget = existing_hand.get(identity)
                 if widget is None:
@@ -980,6 +1274,9 @@ class GameScreen(LiveScreen):
             for index, widget in enumerate(hand_widgets):
                 if index < len(hand_area.children) and hand_area.children[index] is not widget:
                     hand_area.move_child(widget, before=hand_area.children[index])
+                if sort_changed:
+                    widget.animate_sort(index)
+            self._rendered_hand_sort = self.hand_sort
 
             existing_board = {
                 child.identity: child for child in board_area.children
@@ -992,7 +1289,7 @@ class GameScreen(LiveScreen):
                 is_new = identity not in old_table_ids
                 if trick is None:
                     attack = BoardCard(identity, row.get("attack"), selected=identity == self.selected_table_id)
-                    defense = Static("", classes="table-card")
+                    defense = BoardDefenseCard()
                     trick = TrickRow(identity, attack, defense)
                     await board_area.mount(trick)
                 attack = trick.attack_card
@@ -1010,6 +1307,12 @@ class GameScreen(LiveScreen):
                         animate=self._table_layout_initialized and is_new,
                         from_y=4 if is_new else 0,
                     )
+                    actor_name = self._pending_actor_labels.pop((identity, "attack"), None)
+                    if actor_name:
+                        attack.show_actor(actor_name)
+                defense_actor = self._pending_actor_labels.pop((identity, "defense"), None)
+                if defense_actor:
+                    trick.defense_card.show_actor(defense_actor)
             self._known_table_cards = next_table_ids
             self._table_layout_initialized = True
             if not trick_rows:
@@ -1082,6 +1385,7 @@ class GameScreen(LiveScreen):
         self.query_one("#send-chat", Button).disabled = self.busy or self.stale
         self.query_one("#rematch", Button).disabled = self.busy or self.stale
         self.query_one("#confirm-leave", Button).disabled = self.busy or self.stale
+        self.query_one("#sort-hand", Button).disabled = self.busy or self.stale
         self._sync_card_action_buttons()
 
     @on(GameCard.Activated)
@@ -1098,41 +1402,12 @@ class GameScreen(LiveScreen):
         self._update_card_visuals()
         if event.area == "hand":
             self._schedule_hand_signal()
-
-    def _schedule_hand_signal(self) -> None:
-        if not self.is_mounted:
-            return
-        if self.game.get("share_hand_signals", True) is False:
-            self._hand_signal_key = None
-            return
-        selected = tuple(
-            index for index, card in enumerate(self.hand)
-            if str(card.get("hand_id", "")) in self.selected_cards
+    def _display_hand(self) -> list[dict[str, Any]]:
+        trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
+        return _sorted_hand(
+            self.hand, self.hand_sort,
+            trump_card.get("suit") if isinstance(trump_card, dict) else None,
         )
-        if selected == self._hand_signal_key:
-            return
-        self._hand_signal_key = selected
-        self._hand_signal_revision += 1
-        self.run_worker(
-            self._publish_hand_signal(self._hand_signal_revision, selected),
-            group="hand-signal", exclusive=True,
-        )
-
-    async def _publish_hand_signal(self, revision: int, selected: tuple[int, ...]) -> None:
-        # Coalesce quick successive clicks and stay below the server's signal rate limit.
-        await asyncio.sleep(0.06)
-        if revision != self._hand_signal_revision or not self.is_mounted:
-            return
-        if self.game.get("share_hand_signals", True) is False:
-            return
-        try:
-            await SocketFeed(self.client_app.client).send(
-                Subscription("game", self.game_id),
-                {"action": "hand_signal", "sort": "dealt", "selected": list(selected)},
-            )
-        except ClientError as error:
-            if self.is_mounted:
-                self.notice(f"Could not share hand selection: {error}", error=True)
 
     def _selected_card_ids(self) -> list[str]:
         return [
@@ -1175,7 +1450,14 @@ class GameScreen(LiveScreen):
     @on(Button.Pressed)
     def press(self, event: Button.Pressed) -> None:
         identity = event.button.id
-        if identity in {"attack", "defend", "transfer", "bito", "take", "pass"}:
+        if identity == "sort-hand":
+            if self.busy or self.stale:
+                return
+            self.hand_sort = _HAND_SORTS[(_HAND_SORTS.index(self.hand_sort) + 1) % len(_HAND_SORTS)]
+            self.query_one("#sort-hand", Button).label = _HAND_SORT_LABELS[self.hand_sort]
+            self._schedule_card_widgets()
+            self._schedule_hand_signal()
+        elif identity in {"attack", "defend", "transfer", "bito", "take", "pass"}:
             if not self.busy and not self.stale:
                 self.start_action(lambda: self._game_command(identity))
         elif identity == "leave":
