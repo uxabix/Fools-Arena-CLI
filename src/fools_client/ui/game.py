@@ -1,6 +1,7 @@
 """Live game table and lobby chat; all game decisions remain server-side."""
 
 import asyncio
+import math
 from typing import Any
 
 from rich import box
@@ -17,7 +18,7 @@ from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Button, Footer, Header, Input, Label, Static
 
-from fools_client.errors import ClientError, display_text
+from fools_client.errors import ApiError, ClientError, display_text
 from fools_client.realtime import SocketFeed, Subscription
 from fools_client.ui.common import LiveScreen, SnapshotTable
 
@@ -47,14 +48,14 @@ def _rank_symbol(value: Any) -> str:
 
 def _card_panel(
     card: Any, *, selected: bool = False, trump: bool = False, face_down: bool = False,
-    focused: bool = False, playable: bool = False,
+    focused: bool = False, playable: bool = False, error_highlight: bool = False,
 ) -> Panel:
     if face_down:
         face = Text("╱ ▒ ▒ ╲\n│ ▒ ▒ │\n╲ ▒ ▒ ╱", style="bright_blue", justify="center")
-        return Panel(face, title="Card back", box=box.ROUNDED, width=11, height=7, border_style="blue")
+        return Panel(face, title="Card back", box=box.ROUNDED, width=13, height=8, border_style="blue")
     if not isinstance(card, dict):
         face = Text("\n   ·\n", style="dim", justify="center")
-        return Panel(face, title="Uncovered", box=box.ROUNDED, width=11, height=7, border_style="dim")
+        return Panel(face, title="Uncovered", box=box.ROUNDED, width=13, height=8, border_style="dim")
 
     rank = _rank_symbol(card.get("rank"))
     symbol = _suit_symbol(card.get("suit"))
@@ -62,7 +63,7 @@ def _card_panel(
     # A card must keep the same footprint when it is selected.  Letting a
     # selected card grow makes Textual lay out the whole hand again, which is
     # especially visible while a card is arriving at the table.
-    face_width = 9
+    face_width = 11
     face_style = "bold red" if red else "bold white"
     face = Text()
 
@@ -79,6 +80,9 @@ def _card_panel(
             face.append(" " * right_padding)
             face.append(right, style=face_style)
 
+    if selected:
+        face.append("SELECT", style="bold yellow")
+        face.append("\n")
     line(left=rank)
     face.append("\n")
     line(left=symbol)
@@ -88,12 +92,39 @@ def _card_panel(
     line(right=symbol)
     face.append("\n")
     line(right=rank)
-    title = Text("SELECTED", style="bold yellow") if selected else "TRUMP" if trump else None
-    border = "cyan" if focused else "bright_green" if playable else "bright_yellow" if selected or trump else "red" if red else "white"
+    title = Text("INVALID", style="bold bright_red") if error_highlight else "TRUMP" if trump else None
+    border = (
+        "bright_red" if error_highlight else "cyan" if focused else
+        "bright_green" if playable else "bright_yellow" if selected or trump else
+        "red" if red else "white"
+    )
     return Panel(
         face, title=title, box=box.ROUNDED, padding=(0, 0),
-        width=11, height=7,
+        width=13, height=8,
         border_style=border,
+    )
+
+
+def _trump_pile_panel(card: Any, *, in_deck: bool) -> Panel:
+    """Show the trump card while it is in stock, then retain only its suit."""
+    if not isinstance(card, dict):
+        return Panel(
+            Text("No trump", justify="center"), title="Trump",
+            box=box.ROUNDED, width=11, height=7,
+        )
+    symbol = _suit_symbol(card.get("suit"))
+    red = symbol in {"♥", "♦"}
+    color = "bold red" if red else "bold white"
+    if not in_deck:
+        return Panel(
+            Text(symbol, style=f"{color} on default", justify="center"),
+            box=box.ROUNDED, width=7, height=5, border_style="bright_yellow",
+        )
+    rank = _rank_symbol(card.get("rank"))
+    face = Text(f"{rank}\n\n{symbol}\n\n{rank}", style=color, justify="center")
+    return Panel(
+        face, title="TRUMP", box=box.ROUNDED, padding=(0, 0),
+        width=11, height=7, border_style="bright_yellow",
     )
 
 
@@ -101,6 +132,8 @@ class GameCard(Static):
     """Focusable, clickable card widget; selection is interpreted by GameScreen."""
 
     can_focus = True
+    selection_lift = reactive(0.0)
+    shake_progress = reactive(0.0)
     BINDINGS = [
         Binding("enter", "activate", "Select card"),
         Binding("space", "activate", "Select card"),
@@ -123,6 +156,12 @@ class GameCard(Static):
         self.selected = selected
         self.trump = trump
         self.playable = playable
+        self.error_highlight = False
+        self._error_animation_generation = 0
+        self._error_base_offset = None
+        # A restored screen may already contain a selected card.  Put it in
+        # its final position without playing an animation before it is shown.
+        self.selection_lift = -1.0 if selected and area == "hand" else 0.0
         self.set_class(selected, "selected")
         self.refresh_card()
 
@@ -135,18 +174,75 @@ class GameCard(Static):
         )
         if not changed:
             return
+        selection_changed = selected != self.selected
         self.card = card
         self.selected = selected
         self.trump = trump
         self.playable = playable
         self.set_class(selected, "selected")
         self.refresh_card()
+        if selection_changed and self.area == "hand":
+            self._animate_selection(selected)
+
+    def _animate_selection(self, selected: bool) -> None:
+        """Lift or return a hand card without changing the hand's layout."""
+        target = -1.0 if selected else 0.0
+        if not self.is_mounted:
+            self.selection_lift = target
+            return
+        self.animate(
+            "selection_lift", target,
+            duration=0.18 if selected else 0.14,
+            easing="out_back" if selected else "in_out_cubic",
+        )
+
+    def watch_selection_lift(self, value: float) -> None:
+        # Hand cards normally have no positional offset.  Moving only this
+        # widget gives selection a visible motion while preserving every
+        # card's footprint and preventing sibling reflow.
+        if self.area == "hand" and not self.error_highlight:
+            self.styles.offset = (0, round(value))
 
     def refresh_card(self) -> None:
         self.update(_card_panel(
             self.card, selected=self.selected, trump=self.trump,
             focused=self.has_focus, playable=self.playable,
+            error_highlight=self.error_highlight,
         ))
+
+    def flash_error(self) -> None:
+        self._error_animation_generation += 1
+        generation = self._error_animation_generation
+        if not self.error_highlight:
+            self._error_base_offset = self.styles.offset
+        self.error_highlight = True
+        self.refresh_card()
+        self.shake_progress = 0.0
+        self.animate(
+            "shake_progress", 1.0, duration=0.62, easing="linear",
+            on_complete=lambda: self._finish_error_animation(generation),
+        )
+
+    def watch_shake_progress(self, progress: float) -> None:
+        # Four small side-to-side shakes, with decreasing travel, then settle
+        # exactly at the card's original layout offset.
+        travel = math.sin(progress * math.tau * 4) * 2 * (1 - progress)
+        base = self._error_base_offset or self.styles.offset
+        self.styles.offset = (base.x.value + round(travel), base.y.value)
+
+    def _finish_error_animation(self, generation: int) -> None:
+        if generation != self._error_animation_generation:
+            return
+        if self._error_base_offset is not None:
+            self.styles.offset = self._error_base_offset
+        self.set_timer(0.25, lambda: self._clear_error_highlight(generation))
+
+    def _clear_error_highlight(self, generation: int) -> None:
+        if generation != self._error_animation_generation or not self.is_mounted:
+            return
+        self.error_highlight = False
+        self._error_base_offset = None
+        self.refresh_card()
 
     def on_focus(self) -> None:
         self.call_after_refresh(self.refresh_card)
@@ -385,6 +481,7 @@ class GameScreen(LiveScreen):
             yield Static(self.game_id, markup=False, classes="muted")
             yield Static("", id="connection", markup=False, classes="connection")
             yield Static("Loading game snapshot…", id="game-info", markup=False)
+            yield Static("", id="result", markup=False, classes="result")
             yield Static("", id="turn-info", markup=False, classes="warning")
             with HorizontalScroll(id="player-art", classes="opponent-board"):
                 pass
@@ -406,7 +503,13 @@ class GameScreen(LiveScreen):
                 yield Button("Done throwing", id="pass")
                 yield Button("Leave game", id="leave", variant="error")
                 yield Button("Rematch", id="rematch", variant="success")
+                yield Button("Back to lobbies", id="lobbies")
                 yield Button("Open graphical UI", id="web")
+            with Vertical(id="leave-confirmation"):
+                yield Static("Leave the game? The server will end the game and record your loss.", markup=False, classes="warning")
+                with Grid(classes="actions"):
+                    yield Button("Confirm leave", id="confirm-leave", variant="error")
+                    yield Button("Stay", id="cancel-leave")
             with VerticalScroll(id="chat-panel"):
                 yield Label("Lobby chat", classes="heading")
                 yield Static("Waiting for chat snapshot…", id="chat-connection", markup=False, classes="connection")
@@ -416,12 +519,12 @@ class GameScreen(LiveScreen):
                     yield Button("Send", id="send-chat", variant="primary")
             yield Static(self.initial_notice, id="notice", markup=False)
             yield Static("The server enforces rules and owns game state. A fresh snapshot is loaded after each command.", markup=False, classes="muted")
-            with Vertical(id="leave-confirmation"):
-                yield Static("Leave the game? The server will end the game and record your loss.", markup=False, classes="warning")
-                with Grid(classes="actions"):
-                    yield Button("Confirm leave", id="confirm-leave", variant="error")
-                    yield Button("Stay", id="cancel-leave")
         yield Footer()
+
+    def _flash_rule_error(self) -> None:
+        for card in self.query(GameCard):
+            if card.selected:
+                card.flash_error()
 
     def on_mount(self) -> None:
         self.query_one("#chat", SnapshotTable).setup("Time", "Player", "Message")
@@ -503,6 +606,7 @@ class GameScreen(LiveScreen):
             f"Phase: {display_text(self.turn.get('phase', '—'))}."
         )
         me = self.client_app.profile.user_id if self.client_app.profile else ""
+        self._render_result(str(me))
         role = []
         if self.turn.get("attacker_id") == me:
             role.append("You are attacking")
@@ -563,6 +667,40 @@ class GameScreen(LiveScreen):
         self.query_one("#rematch", Button).display = bool(self.game.get("can_rematch"))
         self.query_one("#rematch", Button).disabled = self.busy or self.stale
         self.query_one("#leave-confirmation").display = self.confirm_leave
+
+    def _render_result(self, me_id: str) -> None:
+        result = self.query_one("#result", Static)
+        finished = self.game.get("status") == "finished"
+        result.display = finished
+        if not finished:
+            return
+
+        loser_id = str(self.game.get("loser_id") or "")
+        loser = next(
+            (player for player in self.players if str(player.get("user_id", "")) == loser_id),
+            None,
+        )
+        if loser_id and loser_id == me_id:
+            title = Text("You lost!", style="bold bright_red")
+            detail = Text("You are the fool this game.")
+        elif loser is not None:
+            title = Text("You won!", style="bold bright_green")
+            detail = Text("The fool this game is ")
+            detail.append(display_text(loser.get("username", "Player")), style="bold")
+            detail.append(".")
+        else:
+            title = Text("Game over", style="bold bright_yellow")
+            detail = Text("This game has finished.")
+
+        message = Text()
+        message.append(title)
+        message.append("\n")
+        message.append(detail)
+        if self.game.get("can_rematch"):
+            message.append("\nYou can request a rematch.", style="dim")
+        else:
+            message.append("\nThe host can deal another game for everyone still in the lobby.", style="dim")
+        result.update(message)
 
     def _render_visual_table(self, me: str) -> None:
         """Paint the visible board from the latest server snapshot only."""
@@ -663,6 +801,7 @@ class GameScreen(LiveScreen):
 
     async def _render_piles(self) -> None:
         trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
+        trump_in_deck = self.deck.get("trump_in_deck", self.game.get("trump_in_deck", True)) is True
         pile_art = self.query_one("#pile-art", Horizontal)
         if not self._piles_initialized:
             self._deck_pile = Static(classes="pile-item", markup=False)
@@ -679,12 +818,13 @@ class GameScreen(LiveScreen):
             ))
             self._pile_signatures["deck"] = deck_signature
 
-        trump_signature = trump_card
+        trump_signature = (trump_card, trump_in_deck)
         if "trump" not in self._pile_signatures or self._pile_signatures["trump"] != trump_signature:
-            self._trump_pile.update(_card_panel(trump_card, trump=True) if trump_card else Panel(
-                Text("No trump", justify="center"), title="Trump", box=box.ROUNDED, width=11, height=7,
-            ))
-            self._pile_signatures["trump"] = trump_signature.copy() if isinstance(trump_signature, dict) else trump_signature
+            self._trump_pile.update(_trump_pile_panel(trump_card, in_deck=trump_in_deck))
+            self._pile_signatures["trump"] = (
+                trump_card.copy() if isinstance(trump_card, dict) else trump_card,
+                trump_in_deck,
+            )
 
         discard_signature = self.deck.get("discard_count")
         if "discard" not in self._pile_signatures or self._pile_signatures["discard"] != discard_signature:
@@ -1008,17 +1148,23 @@ class GameScreen(LiveScreen):
         selected_table = self.selected_table_id
         selected_card = next((card for card in self.hand if str(card.get("hand_id")) in self.selected_cards), None)
         game = self.client_app.games
-        match action:
-            case "attack": await game.attack(self.game_id, card_ids)
-            case "transfer": await game.transfer(self.game_id, card_ids)
-            case "defend":
-                if selected_table is None or selected_card is None or len(card_ids) != 1:
-                    self.notice("Select one card from your hand and an attack row on the table.", error=True)
-                    return
-                await game.defend(self.game_id, selected_table, str(selected_card["id"]))
-            case "take": await game.take(self.game_id)
-            case "pass": await game.pass_turn(self.game_id)
-            case "bito": await game.bito(self.game_id)
+        try:
+            match action:
+                case "attack": await game.attack(self.game_id, card_ids)
+                case "transfer": await game.transfer(self.game_id, card_ids)
+                case "defend":
+                    if selected_table is None or selected_card is None or len(card_ids) != 1:
+                        self.notice("Select one card from your hand and an attack row on the table.", error=True)
+                        return
+                    await game.defend(self.game_id, selected_table, str(selected_card["id"]))
+                case "take": await game.take(self.game_id)
+                case "pass": await game.pass_turn(self.game_id)
+                case "bito": await game.bito(self.game_id)
+        except ApiError:
+            # Catch the server rejection here so only rejected game actions
+            # trigger the visual error effect. Chat and rematch errors do not.
+            self._flash_rule_error()
+            raise
         self.selected_cards.clear()
         self.selected_table_id = None
         self._update_card_visuals()
@@ -1037,6 +1183,9 @@ class GameScreen(LiveScreen):
                 return
             self.confirm_leave = True
             self._render_game()
+            self.query_one(".detail", VerticalScroll).scroll_to_widget(
+                self.query_one("#leave-confirmation"), animate=False,
+            )
         elif identity == "confirm-leave":
             if not self.busy and not self.stale:
                 self.confirm_leave = False
@@ -1047,6 +1196,9 @@ class GameScreen(LiveScreen):
         elif identity == "rematch":
             if not self.busy and not self.stale and self.game.get("can_rematch"):
                 self.start_action(self.rematch)
+        elif identity == "lobbies":
+            if not self.busy:
+                self.client_app.show_lobbies()
         elif identity == "send-chat":
             if not self.busy and not self.stale:
                 self.start_action(self.send_chat)
@@ -1072,8 +1224,7 @@ class GameScreen(LiveScreen):
 
     async def leave_game(self) -> None:
         await self.client_app.games.leave(self.game_id)
-        self.notice("You left the game. Loading the final snapshot.")
-        self.start_stream()
+        self.client_app.show_lobbies("You left the game.")
 
     async def rematch(self) -> None:
         next_game = await self.client_app.games.rematch(self.game_id)

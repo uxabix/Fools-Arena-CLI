@@ -63,6 +63,13 @@ Button {
     margin: 1 0;
 }
 
+.result {
+    height: auto;
+    border: round $accent;
+    padding: 1 2;
+    margin: 1 0;
+}
+
 #notice {
     min-height: 1;
     margin: 1 0;
@@ -145,24 +152,25 @@ Button {
 }
 
 #hand-cards {
-    height: 11;
-    min-height: 9;
-    padding: 1;
+    /* Two empty rows keep the lifted card fully inside the viewport. */
+    height: 14;
+    min-height: 14;
+    padding: 2 1;
     align-horizontal: center;
     border: round $accent;
     margin-bottom: 1;
 }
 
 .game-card {
-    width: 11;
-    height: 7;
+    width: 13;
+    height: 8;
     margin: 0 1;
 }
 
 .game-card.selected {
-    /* Keep the hand's geometry stable; selection is represented by the
-       card's border and title, not by making every sibling move aside. */
-    offset: 0 -1;
+    /* The lift is animated by GameCard.selection_lift. Keeping the class
+       free of an offset lets Textual interpolate from the card's old
+       position rather than applying the selected position immediately. */
 }
 
 .trick-row {
@@ -224,7 +232,7 @@ Button {
     min-width: 14;
 }
 
-#confirmation {
+#confirmation, #leave-confirmation {
     display: none;
     height: auto;
     border: round $warning;

@@ -3,7 +3,7 @@
 import unittest
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import httpx
 
@@ -15,6 +15,7 @@ from fools_client.live import SnapshotLoader
 from fools_client.realtime import Subscription
 from fools_client.ui.app import FoolsApp
 from fools_client.ui.game import GameCard, OpponentFan, _card_panel
+from fools_client.ui.game import GameScreen
 from textual.app import App
 
 
@@ -199,6 +200,19 @@ class IncrementalGameRenderTests(unittest.TestCase):
 
         refresh.assert_not_called()
 
+    def test_selecting_a_mounted_hand_card_animates_its_lift(self):
+        payload = {"rank": "ace", "suit": "spades"}
+        card = GameCard("hand", HAND_ID, payload)
+
+        with patch.object(type(card), "is_mounted", new_callable=PropertyMock, return_value=True), patch.object(
+            card, "animate",
+        ) as animate:
+            card.set_card(payload, selected=True, trump=False)
+
+        animate.assert_called_once_with(
+            "selection_lift", -1.0, duration=0.18, easing="out_back",
+        )
+
     def test_unchanged_opponent_fan_is_not_repainted(self):
         fan = OpponentFan("opponent")
 
@@ -219,6 +233,54 @@ class IncrementalGameRenderTests(unittest.TestCase):
             fan._paint_fan()
 
         self.assertIn("▲", str(update.call_args.args[0]))
+
+    def test_invalid_card_is_red_and_animated_side_to_side(self):
+        payload = {"rank": "ace", "suit": "spades"}
+        card = GameCard("hand", HAND_ID, payload, selected=True)
+        card.styles.offset = (3, 4)
+
+        with patch.object(card, "refresh_card"), patch.object(card, "animate") as animate, patch.object(
+            card, "set_timer",
+        ) as set_timer:
+            card.flash_error()
+            card.watch_shake_progress(0.0625)
+            self.assertEqual((card.styles.offset.x.value, card.styles.offset.y.value), (5.0, 4.0))
+            card._finish_error_animation(1)
+
+        self.assertTrue(card.error_highlight)
+        self.assertEqual((card.styles.offset.x.value, card.styles.offset.y.value), (3.0, 4.0))
+        animate.assert_called_once()
+        set_timer.assert_called_once()
+        highlighted = _card_panel(payload, selected=True, error_highlight=True)
+        self.assertEqual(highlighted.border_style, "bright_red")
+
+    def test_rule_error_shakes_selected_cards_only(self):
+        screen = GameScreen(GAME_ID)
+        selected_card = type("SelectedCard", (), {"selected": True, "flash_error": lambda self: None})()
+        other_card = type("OtherCard", (), {"selected": False, "flash_error": lambda self: None})()
+        with patch.object(screen, "query", return_value=[selected_card, other_card]), patch.object(
+            selected_card, "flash_error",
+        ) as flash_selected, patch.object(other_card, "flash_error") as flash_other:
+            screen._flash_rule_error()
+
+        flash_selected.assert_called_once()
+        flash_other.assert_not_called()
+
+    def test_server_rejection_triggers_flash_from_game_command(self):
+        screen = GameScreen(GAME_ID)
+
+        class RejectingGameService:
+            async def take(self, _game_id):
+                raise ApiError(400, {"detail": "Illegal move"})
+
+        with patch.object(
+            GameScreen, "client_app", new_callable=PropertyMock,
+        ) as client_app, patch.object(screen, "_flash_rule_error") as flash:
+            client_app.return_value.games = RejectingGameService()
+            with self.assertRaises(ApiError):
+                run_immediate(screen._game_command("take"))
+
+        flash.assert_called_once()
 
 
 class ApiClientResponseTests(unittest.TestCase):
