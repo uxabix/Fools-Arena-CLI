@@ -70,6 +70,15 @@ def _card_value(card: dict[str, Any]) -> float:
     return float(_RANK_VALUES.get(str(card.get("rank", "")).lower(), 0))
 
 
+def _can_beat(defense: dict[str, Any], attack: dict[str, Any], trump_suit: str) -> bool:
+    """Return a display hint for a normal card defense; the server validates it."""
+    defense_suit = _suit_symbol(defense.get("suit"))
+    attack_suit = _suit_symbol(attack.get("suit"))
+    if defense_suit == attack_suit:
+        return _card_value(defense) > _card_value(attack)
+    return bool(trump_suit) and defense_suit == trump_suit and attack_suit != trump_suit
+
+
 def _sorted_hand(
     hand: list[dict[str, Any]], mode: str, trump_suit: Any,
 ) -> list[dict[str, Any]]:
@@ -651,6 +660,7 @@ class GameScreen(LiveScreen):
         self.messages: list[dict[str, Any]] = []
         self.hand_sort = "suit-left"
         self.hand_signals: dict[str, dict[str, Any]] = {}
+        self.playable_hand_ids: set[str] = set()
         self._hand_signal_key: tuple[str, tuple[int, ...]] | None = None
         self._hand_signal_revision = 0
         self.selected_cards: set[str] = set()
@@ -915,6 +925,12 @@ class GameScreen(LiveScreen):
         )
         me = self.client_app.profile.user_id if self.client_app.profile else ""
         self._render_result(str(me))
+        phase = self.turn.get("phase")
+        me_id = str(me)
+        attacker = str(self.turn.get("attacker_id", "")) == me_id
+        defender = str(self.turn.get("defender_id", "")) == me_id
+        passed = {str(identity) for identity in (self.turn.get("passed_ids") or [])}
+        pending = {str(identity) for identity in (self.turn.get("pending_ids") or [])}
         role = []
         if self.turn.get("attacker_id") == me:
             role.append("You are attacking")
@@ -925,26 +941,110 @@ class GameScreen(LiveScreen):
         current_table_ids = {str(row.get("id")) for row in self.table}
         if self.selected_table_id not in current_table_ids:
             self.selected_table_id = None
+        self.playable_hand_ids = self._playable_hand_ids(
+            me_id, phase, attacker, defender, passed,
+        )
         self._render_visual_table(me)
         self._update_selection_label()
-        phase = self.turn.get("phase")
-        me_id = str(me)
-        attacker = str(self.turn.get("attacker_id", "")) == me_id
-        defender = str(self.turn.get("defender_id", "")) == me_id
-        passed = {str(identity) for identity in (self.turn.get("passed_ids") or [])}
-        pending = {str(identity) for identity in (self.turn.get("pending_ids") or [])}
         self.query_one("#turn-info", Static).update(self._turn_prompt(
             me_id, phase, attacker, defender, pending, passed,
         ))
+        # These are presentation hints derived from the server's snapshot;
+        # they neither validate a move nor change game state. The server still
+        # remains authoritative when a button posts its command.
+        can_play = self.game.get("status") == "in_progress"
+        has_table = bool(self.table)
+        has_open_cards = any(not row.get("defense") for row in self.table)
+        all_defended = has_table and not has_open_cards
+        wave = phase in {"build", "defend"}
+        neighbor_only = bool(self.game.get("neighbor_throw_only"))
+        neighbor_ids: set[str] = set()
+        if neighbor_only and self.players:
+            circle = sorted(self.players, key=lambda player: player.get("seat_position", 0))
+            defender_index = next((
+                index for index, player in enumerate(circle)
+                if str(player.get("user_id", "")) == str(self.turn.get("defender_id", ""))
+            ), None)
+            if defender_index is not None and len(circle) > 1:
+                neighbor_ids = {
+                    str(circle[(defender_index - 1) % len(circle)].get("user_id", "")),
+                    str(circle[(defender_index + 1) % len(circle)].get("user_id", "")),
+                }
+        can_throw_in = (
+            can_play and bool(self.hand) and has_table and not defender
+            and phase in {"build", "defend", "taking"} and me_id not in passed
+            and (not neighbor_only or me_id in neighbor_ids)
+        )
+        visibility = {
+            "attack": can_play and bool(self.hand) and (
+                (phase == "between" and attacker) or can_throw_in
+            ),
+            "defend": can_play and bool(self.hand) and wave and defender and has_open_cards,
+            "transfer": (
+                can_play and bool(self.hand) and wave and defender and has_open_cards
+                and self.game.get("transferable") is True
+            ),
+            "bito": can_play and wave and attacker and all_defended,
+            "take": can_play and wave and defender and has_open_cards,
+            "pass": can_play and phase == "taking" and me_id in pending,
+        }
+        for identity, visible in visibility.items():
+            button = self.query_one(f"#{identity}", Button)
+            button.display = visible
+            button.disabled = self.busy or self.stale
         self.query_one("#attack", Button).label = "Attack" if phase == "between" else "Throw in"
         self.query_one("#sort-hand", Button).disabled = self.busy or self.stale
-        # Keep actions available from every snapshot. The server decides which
-        # actions are valid for the current phase and player.
-        for identity in ("attack", "defend", "transfer", "bito", "take", "pass", "leave"):
-            self.query_one(f"#{identity}", Button).disabled = self.busy or self.stale
+        leave = self.query_one("#leave", Button)
+        leave.display = can_play
+        leave.disabled = self.busy or self.stale
         self.query_one("#rematch", Button).display = bool(self.game.get("can_rematch"))
         self.query_one("#rematch", Button).disabled = self.busy or self.stale
         self.query_one("#leave-confirmation").display = self.confirm_leave
+
+    def _playable_hand_ids(
+        self, me_id: str, phase: Any, attacker: bool, defender: bool, passed: set[str],
+    ) -> set[str]:
+        """Project likely playable cards for the current server snapshot.
+
+        This only colors cards; selecting or posting any card remains possible
+        and the server remains the sole validator of every command.
+        """
+        if self.game.get("status") != "in_progress" or not self.hand:
+            return set()
+        hand_ids = {
+            str(card.get("hand_id", "")) for card in self.hand
+            if isinstance(card.get("hand_id"), str)
+        }
+        if phase == "between" and attacker:
+            return hand_ids
+
+        open_attacks = [
+            row.get("attack") for row in self.table
+            if not row.get("defense") and isinstance(row.get("attack"), dict)
+        ]
+        if not open_attacks:
+            return set()
+        trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
+        trump_suit = _suit_symbol(trump_card.get("suit")) if isinstance(trump_card, dict) else ""
+        playable: set[str] = set()
+
+        if phase in {"build", "defend"} and defender:
+            playable.update(
+                str(card["hand_id"]) for card in self.hand
+                if isinstance(card.get("hand_id"), str)
+                and any(_can_beat(card, attack, trump_suit) for attack in open_attacks)
+            )
+
+        if phase in {"build", "defend", "taking"} and not defender and me_id not in passed:
+            table_values = {
+                _card_value(card) for row in self.table for card in (row.get("attack"), row.get("defense"))
+                if isinstance(card, dict)
+            }
+            playable.update(
+                str(card["hand_id"]) for card in self.hand
+                if isinstance(card.get("hand_id"), str) and _card_value(card) in table_values
+            )
+        return playable
 
     def _render_result(self, me_id: str) -> None:
         result = self.query_one("#result", Static)
@@ -1172,6 +1272,7 @@ class GameScreen(LiveScreen):
                 widget.set_card(
                     card, selected=identity in self.selected_cards,
                     trump=bool(trump_suit) and _suit_symbol(card.get("suit")) == trump_suit,
+                    playable=identity in self.playable_hand_ids,
                 )
                 hand_widgets.append(widget)
             if not hand_widgets and not list(hand_area.children):
@@ -1245,6 +1346,7 @@ class GameScreen(LiveScreen):
                 widget.set_card(
                     card, selected=widget.identity in self.selected_cards,
                     trump=bool(trump_suit) and _suit_symbol(card.get("suit")) == trump_suit,
+                    playable=widget.identity in self.playable_hand_ids,
                 )
             elif widget.area == "table":
                 widget.set_card(widget.card, selected=widget.identity == self.selected_table_id, trump=False)

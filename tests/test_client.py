@@ -184,6 +184,28 @@ class ApiClientTests(unittest.TestCase):
 
 
 class IncrementalGameRenderTests(unittest.TestCase):
+    def test_playable_cards_are_projected_for_attack_and_defense(self):
+        screen = GameScreen(GAME_ID)
+        screen.game = {"status": "in_progress"}
+        screen.hand = [
+            {"hand_id": "attack", "rank": "ace", "suit": "spades"},
+            {"hand_id": "defense", "rank": "king", "suit": "hearts"},
+            {"hand_id": "other", "rank": "six", "suit": "clubs"},
+        ]
+
+        self.assertEqual(
+            screen._playable_hand_ids(USER_ID, "between", True, False, set()),
+            {"attack", "defense", "other"},
+        )
+
+        screen.table = [{
+            "attack": {"rank": "queen", "suit": "hearts"}, "defense": None,
+        }]
+        self.assertEqual(
+            screen._playable_hand_ids(USER_ID, "defend", False, True, set()),
+            {"defense"},
+        )
+
     def test_selected_card_keeps_the_same_footprint(self):
         card = {"rank": "ace", "suit": "hearts"}
 

@@ -219,6 +219,12 @@ Button {
     max-height: 11;
 }
 
+/* The current server snapshot decides which play actions are available.
+   Keep them hidden while the initial snapshot is still loading. */
+#attack, #defend, #transfer, #bito, #take, #pass, #leave, #rematch {
+    display: none;
+}
+
 .game-actions Button {
     /* A long label must not make its entire grid row taller than the other
        action rows. On narrow terminals it is truncated rather than wrapped. */
