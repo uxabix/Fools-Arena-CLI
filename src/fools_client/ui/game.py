@@ -653,7 +653,6 @@ class GameScreen(LiveScreen):
         self.hand_signals: dict[str, dict[str, Any]] = {}
         self._hand_signal_key: tuple[str, tuple[int, ...]] | None = None
         self._hand_signal_revision = 0
-        self.playable_hand_ids: set[str] = set()
         self.selected_cards: set[str] = set()
         self.selected_table_id: str | None = None
         self._card_render_lock = asyncio.Lock()
@@ -748,7 +747,7 @@ class GameScreen(LiveScreen):
                     if "connection" in panels:
                         connection = panels["connection"]
                         state = connection.get("state", "")
-                        self.query_one("#chat-connection", Static).update(
+                        self._set_chat_connection(
                             "Chat connected." if state == "live" else
                             "Synchronizing chat…" if state == "synchronizing" else
                             "Chat connection lost; reconnecting…"
@@ -757,8 +756,15 @@ class GameScreen(LiveScreen):
                         self.messages = panels["chat"]
                         self._render_chat()
         except ClientError as error:
-            if self.is_mounted:
-                self.query_one("#chat-connection", Static).update(display_text(error))
+            self._set_chat_connection(display_text(error))
+
+    def _set_chat_connection(self, message: str) -> None:
+        # A lobby snapshot can start the chat worker while the screen is still
+        # mounting, and a late WebSocket update can arrive as it is unmounting.
+        # In either case, the widget may not be in the DOM yet.
+        widget = next(iter(self.query("#chat-connection")), None)
+        if widget is not None:
+            widget.update(message)
 
     def apply_panels(self, panels: dict[str, Any]) -> None:
         previous_events = self.events
@@ -921,52 +927,21 @@ class GameScreen(LiveScreen):
             self.selected_table_id = None
         self._render_visual_table(me)
         self._update_selection_label()
-        can_play = self.game.get("status") == "in_progress"
         phase = self.turn.get("phase")
         me_id = str(me)
         attacker = str(self.turn.get("attacker_id", "")) == me_id
         defender = str(self.turn.get("defender_id", "")) == me_id
         passed = {str(identity) for identity in (self.turn.get("passed_ids") or [])}
         pending = {str(identity) for identity in (self.turn.get("pending_ids") or [])}
-        me_player = next(
-            (player for player in self.players if str(player.get("user_id", "")) == me_id),
-            {},
-        )
-        try:
-            hand_count = max(0, int(me_player.get("cards_remaining") or 0))
-        except (TypeError, ValueError):
-            hand_count = 0
-        has_table = bool(self.table)
-        has_open_cards = any(not row.get("defense") for row in self.table)
-        all_defended = has_table and not has_open_cards
-        wave = phase in {"build", "defend"}
-        self.playable_hand_ids = self._playable_cards(
-            me_id, phase, attacker, defender, passed, has_open_cards,
-        )
         self.query_one("#turn-info", Static).update(self._turn_prompt(
-            me_id, phase, attacker, defender, pending, passed, has_open_cards, all_defended,
+            me_id, phase, attacker, defender, pending, passed,
         ))
-        visibility = {
-            "attack": can_play and hand_count > 0 and (
-                (phase == "between" and attacker)
-                or (wave and not defender and str(me_id) not in passed)
-                or (phase == "taking" and not defender and str(me_id) not in passed)
-            ),
-            "defend": can_play and hand_count > 0 and wave and defender and has_open_cards,
-            "transfer": can_play and wave and defender and has_open_cards
-            and self.game.get("transferable") is not False,
-            "bito": can_play and wave and attacker and all_defended,
-            "take": can_play and wave and defender and has_open_cards,
-            "pass": can_play and phase == "taking" and me_id in pending,
-        }
-        for identity, visible in visibility.items():
-            button = self.query_one(f"#{identity}", Button)
-            button.display = visible
-            button.disabled = self.busy or self.stale or not can_play
         self.query_one("#attack", Button).label = "Attack" if phase == "between" else "Throw in"
         self.query_one("#sort-hand", Button).disabled = self.busy or self.stale
-        self._sync_card_action_buttons()
-        self.query_one("#leave", Button).disabled = self.busy or self.stale or not can_play
+        # Keep actions available from every snapshot. The server decides which
+        # actions are valid for the current phase and player.
+        for identity in ("attack", "defend", "transfer", "bito", "take", "pass", "leave"):
+            self.query_one(f"#{identity}", Button).disabled = self.busy or self.stale
         self.query_one("#rematch", Button).display = bool(self.game.get("can_rematch"))
         self.query_one("#rematch", Button).disabled = self.busy or self.stale
         self.query_one("#leave-confirmation").display = self.confirm_leave
@@ -1011,96 +986,27 @@ class GameScreen(LiveScreen):
         self.run_worker(self._render_piles(), group="pile-render", exclusive=True)
         self._schedule_card_widgets()
 
-    def _playable_cards(
-        self, me: str, phase: Any, attacker: bool, defender: bool,
-        passed: set[str], has_open_cards: bool,
-    ) -> set[str]:
-        """Display-only guidance that mirrors the web client's legal-card marks."""
-        if self.game.get("status") != "in_progress":
-            return set()
-        open_rows = [row for row in self.table if not row.get("defense")]
-        if defender and phase in {"build", "defend"} and open_rows:
-            trump = (self.deck.get("trump_card") or self.game.get("trump_card") or {}).get("suit")
-            def beats(card: dict[str, Any], attack: dict[str, Any]) -> bool:
-                if not trump or not attack:
-                    return False
-                value = card.get("value")
-                attack_value = attack.get("value")
-                if value is None or attack_value is None:
-                    return False
-                if card.get("suit") == trump and attack.get("suit") != trump:
-                    return True
-                if attack.get("suit") == trump and card.get("suit") != trump:
-                    return False
-                return card.get("suit") == attack.get("suit") and value > attack_value
-            legal = {
-                str(card.get("hand_id")) for card in self.hand
-                if any(beats(card, row.get("attack") or {}) for row in open_rows)
-            }
-            if self.game.get("transferable") and len(self.table) < (6 if self.deck.get("discard_count", 0) else 5):
-                ranks = {row.get("attack", {}).get("value") for row in self.table if row.get("attack")}
-                if len(ranks) == 1 and len(open_rows) == len(self.table):
-                    legal.update(
-                        str(card.get("hand_id")) for card in self.hand
-                        if card.get("value") in ranks
-                    )
-            return legal
-
-        can_attack = (
-            (phase == "between" and attacker)
-            or (phase in {"build", "defend", "taking"} and not defender and me not in passed)
-        )
-        if not can_attack:
-            return set()
-        if phase in {"build", "defend", "taking"} and self.game.get("neighbor_throw_only"):
-            ordered = sorted(self.players, key=lambda player: player.get("seat_position", 0))
-            defender_index = next((i for i, player in enumerate(ordered) if str(player.get("user_id")) == str(self.turn.get("defender_id"))), None)
-            my_index = next((i for i, player in enumerate(ordered) if str(player.get("user_id")) == me), None)
-            if defender_index is not None and my_index is not None and len(ordered) > 2:
-                if (defender_index - my_index) % len(ordered) not in {1, len(ordered) - 1}:
-                    return set()
-        cap = 6 if self.deck.get("discard_count", 0) else 5
-        slots = cap - len(self.table)
-        if phase in {"build", "defend", "taking"}:
-            slots = min(slots, max(0, int(next((p.get("cards_remaining", 0) for p in self.players if str(p.get("user_id")) == str(self.turn.get("defender_id"))), 0) or 0) - len(open_rows)))
-        if slots < 1:
-            return set()
-        if phase == "between":
-            return {str(card.get("hand_id")) for card in self.hand}
-        ranks = {
-            card.get("value") for row in self.table for card in (row.get("attack"), row.get("defense"))
-            if isinstance(card, dict)
-        }
-        return {str(card.get("hand_id")) for card in self.hand if card.get("value") in ranks}
-
     def _turn_prompt(
         self, me: str, phase: Any, attacker: bool, defender: bool,
-        pending: set[str], passed: set[str], has_open: bool, all_defended: bool,
+        pending: set[str], passed: set[str],
     ) -> str:
-        if self.game.get("status") != "in_progress":
-            return "Game finished. You can request a rematch if the option is available."
-        if phase == "between":
-            if attacker:
-                return "YOUR MOVE: Attack. Select a card in your hand, then press Attack."
-            actor = next((p.get("username", "player") for p in self.players if str(p.get("user_id")) == str(self.turn.get("attacker_id"))), "the attacker")
-            return f"WAITING: {display_text(actor)} is choosing an attack."
-        if phase == "taking":
-            if defender:
-                return "YOUR MOVE: You are taking the cards. Other players may throw in; wait for them to finish."
-            if me in pending:
-                return "YOUR MOVE: Throw in matching ranks, or press Done throwing."
-            return "WAITING: The defender is taking the cards."
-        if defender and has_open:
-            return "YOUR MOVE: Defend. Select a green highlighted card and its attack card, then press Defend. Or press Take cards."
-        if defender and all_defended:
-            return "WAITING: All attacks are defended. The attacker must finish the round."
-        if attacker and all_defended:
-            return "YOUR MOVE: Throw in matching ranks, or press Beaten to end the round."
-        if not defender and self.playable_hand_ids:
-            return "YOUR MOVE: Throw in a card matching a rank on the table."
-        actor_id = self.turn.get("defender_id") if has_open else self.turn.get("attacker_id")
-        actor = next((p.get("username", "player") for p in self.players if str(p.get("user_id")) == str(actor_id)), "another player")
-        return f"WAITING: {display_text(actor)} is playing."
+        phase_text = display_text(phase or "unknown")
+        if attacker and defender:
+            role_text = "attacker and defender"
+        elif attacker:
+            role_text = "attacker"
+        elif defender:
+            role_text = "defender"
+        elif me in pending:
+            role_text = "waiting participant"
+        elif me in passed:
+            role_text = "finished throwing"
+        else:
+            role_text = "participant"
+        return (
+            f"Server phase: {phase_text} · Your server-reported role: {role_text}. "
+            "Select any needed cards and submit an action; the server validates it."
+        )
 
     async def _render_piles(self) -> None:
         trump_card = self.deck.get("trump_card") or self.game.get("trump_card")
@@ -1266,7 +1172,6 @@ class GameScreen(LiveScreen):
                 widget.set_card(
                     card, selected=identity in self.selected_cards,
                     trump=bool(trump_suit) and _suit_symbol(card.get("suit")) == trump_suit,
-                    playable=identity in self.playable_hand_ids,
                 )
                 hand_widgets.append(widget)
             if not hand_widgets and not list(hand_area.children):
@@ -1340,7 +1245,6 @@ class GameScreen(LiveScreen):
                 widget.set_card(
                     card, selected=widget.identity in self.selected_cards,
                     trump=bool(trump_suit) and _suit_symbol(card.get("suit")) == trump_suit,
-                    playable=widget.identity in self.playable_hand_ids,
                 )
             elif widget.area == "table":
                 widget.set_card(widget.card, selected=widget.identity == self.selected_table_id, trump=False)
@@ -1348,13 +1252,12 @@ class GameScreen(LiveScreen):
         self._update_selection_label()
 
     def _sync_card_action_buttons(self) -> None:
-        """Require an explicit card selection before posting list actions."""
+        """Keep card actions available and let the server validate submissions."""
         if not self.is_mounted:
             return
-        has_selected_cards = bool(self._selected_card_ids())
         for identity in ("attack", "transfer"):
             button = self.query_one(f"#{identity}", Button)
-            button.disabled = self.busy or self.stale or not has_selected_cards
+            button.disabled = self.busy or self.stale
 
     def _update_selection_label(self) -> None:
         if not self.is_mounted:
@@ -1366,11 +1269,14 @@ class GameScreen(LiveScreen):
         )
         self.query_one("#selection", Static).update(
             f"Selected hand cards: {len(self.selected_cards)} · Defense target: {target}. "
-            "Green cards are playable. Use Enter or Space to select a card."
+            "Use Enter or Space to select a card."
         )
 
     def _render_chat(self) -> None:
-        self.query_one("#chat", SnapshotTable).set_rows({
+        table = next(iter(self.query("#chat")), None)
+        if table is None:
+            return
+        table.set_rows({
             str(message["id"]): (
                 display_text(str(message.get("sent_at", ""))[:19]),
                 display_text(message.get("username", message.get("sender", ""))),
@@ -1417,9 +1323,6 @@ class GameScreen(LiveScreen):
 
     async def _game_command(self, action: str) -> None:
         card_ids = self._selected_card_ids()
-        if action in {"attack", "transfer"} and not card_ids:
-            self.notice("Select one or more cards first.", error=True)
-            return
         selected_table = self.selected_table_id
         selected_card = next((card for card in self.hand if str(card.get("hand_id")) in self.selected_cards), None)
         game = self.client_app.games
@@ -1461,7 +1364,7 @@ class GameScreen(LiveScreen):
             if not self.busy and not self.stale:
                 self.start_action(lambda: self._game_command(identity))
         elif identity == "leave":
-            if self.busy or self.stale or self.game.get("status") != "in_progress":
+            if self.busy or self.stale:
                 return
             self.confirm_leave = True
             self._render_game()
