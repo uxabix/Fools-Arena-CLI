@@ -14,7 +14,7 @@ from fools_client.games import GameService, LobbyChatService
 from fools_client.live import SnapshotLoader
 from fools_client.realtime import Subscription
 from fools_client.ui.app import FoolsApp
-from fools_client.ui.game import GameCard, OpponentFan, _card_panel
+from fools_client.ui.game import GameCard, OpponentFan, _card_panel, _tricks_per_line
 from fools_client.ui.game import GameScreen
 from textual.app import App
 
@@ -205,6 +205,11 @@ class IncrementalGameRenderTests(unittest.TestCase):
             screen._playable_hand_ids(USER_ID, "defend", False, True, set()),
             {"defense"},
         )
+
+    def test_table_pairs_wrap_instead_of_shrinking(self):
+        self.assertEqual(_tricks_per_line(200), 8)
+        self.assertEqual(_tricks_per_line(80), 3)
+        self.assertEqual(_tricks_per_line(20), 1)
 
     def test_selected_card_keeps_the_same_footprint(self):
         card = {"rank": "ace", "suit": "hearts"}

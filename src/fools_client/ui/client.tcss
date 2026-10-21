@@ -140,14 +140,17 @@ Button {
 
 .card-board {
     width: 1fr;
-    height: 14;
+    height: auto;
     min-height: 14;
     padding: 1;
     border: round $warning;
     margin-bottom: 1;
+    overflow-x: hidden;
 }
 
-#board-cards {
+.trick-line {
+    width: 1fr;
+    height: 10;
     align-horizontal: center;
 }
 

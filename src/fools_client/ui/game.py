@@ -16,6 +16,7 @@ from textual.containers import Grid, Horizontal, HorizontalScroll, Vertical, Ver
 from textual.events import Click
 from textual.message import Message
 from textual.reactive import reactive
+from textual.widget import Widget
 from textual.widgets import Button, Footer, Header, Input, Label, Static
 
 from fools_client.errors import ApiError, ClientError, display_text
@@ -61,6 +62,23 @@ def _suit_symbol(value: Any) -> str:
 def _rank_symbol(value: Any) -> str:
     rank = str(value or "?").strip()
     return _RANK_SYMBOLS.get(rank.lower(), rank)
+
+
+def _reparent(widget: Widget, parent: Widget, index: int) -> None:
+    """Move a live widget under a new parent without destroying it."""
+    if widget.parent is not None:
+        widget.parent._nodes._remove(widget)
+    widget._attach(parent)
+    parent._nodes._insert(index, widget)
+
+
+def _tricks_per_line(available: int) -> int:
+    """How many full attack/defense pairs fit in one table row.
+
+    Each pair keeps its 24-column frame plus a one-column gap. A narrower
+    terminal starts another row instead of clipping or scrolling sideways.
+    """
+    return max(1, available // 25)
 
 
 def _card_value(card: dict[str, Any]) -> float:
@@ -666,6 +684,7 @@ class GameScreen(LiveScreen):
         self.selected_cards: set[str] = set()
         self.selected_table_id: str | None = None
         self._card_render_lock = asyncio.Lock()
+        self._board_reflow_lock = asyncio.Lock()
         self._card_render_revision = 0
         self._rendered_hand_sort: str | None = None
         self._known_table_cards: set[str] = set()
@@ -691,7 +710,7 @@ class GameScreen(LiveScreen):
             with Horizontal(id="pile-art", classes="pile-art"):
                 pass
             yield Label("Table · Select an attack card to choose a defense target", classes="heading")
-            with HorizontalScroll(id="board-cards", classes="card-board"):
+            with Vertical(id="board-cards", classes="card-board"):
                 pass
             yield Label("Your hand · Select cards to attack or defend", classes="heading")
             yield Button(_HAND_SORT_LABELS[self.hand_sort], id="sort-hand", variant="default", disabled=True)
@@ -1215,6 +1234,40 @@ class GameScreen(LiveScreen):
         if not desired_blocks and not list(player_art.children):
             player_art.mount(Static("Waiting for players…", classes="empty-board"))
 
+    def on_resize(self, event) -> None:
+        if self.is_mounted:
+            self.run_worker(self._reflow_board(), group="board-reflow", exclusive=True)
+
+    async def _reflow_board(self) -> None:
+        """Place table pairs on as many centered rows as the terminal width requires."""
+        if not self.is_mounted:
+            return
+        async with self._board_reflow_lock:
+            await self._reflow_board_locked()
+
+    async def _reflow_board_locked(self) -> None:
+        board = self.query_one("#board-cards", Vertical)
+        order = {str(row.get("id", "")): index for index, row in enumerate(self.table)}
+        tricks = sorted(board.query(TrickRow), key=lambda trick: order.get(trick.identity, 0))
+        available = board.size.width
+        if available <= 0:
+            return
+        groups = []
+        per_line = _tricks_per_line(available)
+        for start in range(0, len(tricks), per_line):
+            groups.append(tricks[start:start + per_line])
+        lines = [child for child in board.children if child.has_class("trick-line")]
+        while len(lines) < len(groups):
+            line = Horizontal(classes="trick-line")
+            await board.mount(line)
+            lines.append(line)
+        for line, group in zip(lines, groups):
+            for index, trick in enumerate(group):
+                _reparent(trick, line, index)
+        for line in lines[len(groups):]:
+            await line.remove()
+        board.refresh(layout=True)
+
     def _schedule_card_widgets(self) -> None:
         if not self.is_mounted:
             return
@@ -1233,16 +1286,15 @@ class GameScreen(LiveScreen):
                 None,
             )
             hand_area = self.query_one("#hand-cards", HorizontalScroll)
-            board_area = self.query_one("#board-cards", HorizontalScroll)
+            board_area = self.query_one("#board-cards", Vertical)
             old_table_ids = set(self._known_table_cards)
             next_table_ids = {str(row.get("id", "")) for row in self.table if row.get("id")}
 
             # Keep table card widgets alive across snapshots; this gives Textual
             # a stable position to animate from as the layout advances.
-            for child in list(board_area.children):
-                identity = getattr(child, "identity", None)
-                if identity not in next_table_ids:
-                    await child.remove()
+            for trick in list(board_area.query(TrickRow)):
+                if trick.identity not in next_table_ids:
+                    await trick.remove()
 
             for child in list(hand_area.children):
                 if not isinstance(child, GameCard) or child.identity not in {str(card.get("hand_id", "")) for card in self.hand}:
@@ -1285,11 +1337,10 @@ class GameScreen(LiveScreen):
             self._rendered_hand_sort = self.hand_sort
 
             existing_board = {
-                child.identity: child for child in board_area.children
-                if isinstance(child, TrickRow)
+                trick.identity: trick for trick in board_area.query(TrickRow)
             }
             trick_rows = []
-            for row_index, row in enumerate(self.table):
+            for row in self.table:
                 identity = str(row.get("id", ""))
                 trick = existing_board.get(identity)
                 is_new = identity not in old_table_ids
@@ -1301,9 +1352,6 @@ class GameScreen(LiveScreen):
                 attack = trick.attack_card
                 attack.set_card(row.get("attack"), selected=identity == self.selected_table_id, trump=False)
                 trick.set_defense(row.get("defense"))
-                rows_now = [c for c in board_area.children if isinstance(c, TrickRow)]
-                if row_index < len(rows_now) and rows_now[row_index] is not trick:
-                    board_area.move_child(trick, before=rows_now[row_index])
                 trick_rows.append(trick)
                 if isinstance(attack, BoardCard):
                     # Keep attacks in the left slot.  A raised defense sits
@@ -1321,8 +1369,16 @@ class GameScreen(LiveScreen):
                     trick.defense_card.show_actor(defense_actor)
             self._known_table_cards = next_table_ids
             self._table_layout_initialized = True
-            if not trick_rows:
-                await board_area.mount(Static("No cards on the table", classes="empty-board"))
+            if trick_rows:
+                for child in list(board_area.children):
+                    if child.has_class("empty-board"):
+                        await child.remove()
+                await self._reflow_board()
+            else:
+                for line in list(board_area.query(".trick-line")):
+                    await line.remove()
+                if not board_area.query(".empty-board"):
+                    await board_area.mount(Static("No cards on the table", classes="empty-board"))
 
             if focused_card:
                 match = next(
